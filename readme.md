@@ -8,7 +8,8 @@ Manage multiple Google Drive and Mega accounts from a single interface with opti
 - <b>Setup Guide</b> - https://multi-drives.vercel.app/guide.html
 - <b>Demo Video</b> - https://www.youtube.com/watch?v=NxMBscRX9ag
 - <b>Demo Website</b> - https://multi-drives.vercel.app/ <br>(if you face any error try please using localhost for testing)
-<br>
+- <b>Need Help</b> - https://tejasmali.dev/contact.html 
+<br> 
  
 <hr>
 <br>
