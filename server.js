@@ -17,8 +17,28 @@ const upload = multer({
 app.use(cors())
 app.use(express.json())
 app.use(express.urlencoded({ extended: true }))
+
+//static assets never need a session, so skip the session store round trip for them.
+//this keeps one browser tab from creating a dozen throwaway sessions (and a dozen
+//Set-Cookie headers racing each other) while the first page load fetches css/js/images.
+const SESSIONLESS_ASSET_RE = /\.(?:css|js|mjs|map|png|jpe?g|gif|webp|avif|svg|ico|woff2?|ttf|eot|txt|xml|webmanifest)$/i
+
+function isSessionlessPath(req) {
+  const p = String(req.path || "")
+  if (p.startsWith("/images/")) return true
+  if (p.startsWith("/css/")) return true
+  if (p.startsWith("/js/")) return true
+  return SESSIONLESS_ASSET_RE.test(p)
+}
+
 app.use(async (req, res, next) => {
+  if (isSessionlessPath(req)) return next()
   try {
+    //every response below depends on the md_sid cookie, so it must never be cached
+    //by the Vercel CDN or a proxy. a cached empty response is what makes the home
+    //screen look like "no accounts connected" even though the session has accounts.
+    res.setHeader("Cache-Control", "private, no-store, max-age=0")
+    res.setHeader("Vary", "Cookie")
     await getOrCreateSession(req, res)
     res.on("finish", () => {
       if (typeof req.saveUserSession === "function") {
@@ -31,6 +51,31 @@ app.use(async (req, res, next) => {
   }
 })
 
+//routes that talk to the Google Drive API with account.token. renewing an expiring
+//access token in one place keeps every one of them working after the first hour.
+const GOOGLE_API_PATHS = new Set([
+  "/storage",
+  "/files",
+  "/open-file",
+  "/search",
+  "/delete-item",
+  "/copy-item",
+  "/move-item",
+  "/create-folder",
+  "/upload-item",
+  "/upload-item-stream"
+])
+
+app.use(async (req, res, next) => {
+  if (!req.userSession || !GOOGLE_API_PATHS.has(req.path)) return next()
+  try {
+    await ensureFreshGoogleTokens(req)
+  } catch (e) {
+    //a failed refresh is reported per account by the route itself.
+  }
+  next()
+})
+
 app.use((req, res, next) => {
   if (req.path === "/upload-item-stream" || req.path === "/upload-item") {
     req.setTimeout(2 * 60 * 60 * 1000)
@@ -38,13 +83,26 @@ app.use((req, res, next) => {
   }
   next()
 })
-app.use(express.static(path.join(__dirname, "public")))
+
+function setStaticCacheHeaders(res, filePath) {
+  //html carries the Set-Cookie for a brand new session, so it must stay uncached.
+  if (/\.html?$/i.test(String(filePath || ""))) {
+    res.setHeader("Cache-Control", "private, no-store, max-age=0")
+  }
+}
+
+app.use(express.static(path.join(__dirname, "public"), { setHeaders: setStaticCacheHeaders }))
 app.use("/images", express.static(path.join(__dirname, "images")))
 //this is credenstial value you can set via .env file or enviroment varialable
 const CLIENT_ID = process.env.CLIENT_ID
 const CLIENT_SECRET = process.env.CLIENT_SECRET
 //this is redirect uri change this if you are self deploying
-const REDIRECT_URI = process.env.GOOGLE_REDIRECT_URI || "https://multi-drives.vercel.app/auth/google/callback"
+//only an explicitly configured value is used. the old hardcoded fallback pointed every
+//deployment at multi-drives.vercel.app, so a fork, a preview URL or a renamed project
+//sent Google's redirect to a different host - a different host means a different
+//session cookie, so the callback landed with no oauth state and the account was lost.
+//with no env var set the callback URL is derived from the incoming request instead.
+const REDIRECT_URI = String(process.env.GOOGLE_REDIRECT_URI || "").trim()
 const MEGA_SESSION_TOKEN = process.env.MEGA_SESSION_TOKEN || ""
 const MEGA_ACCOUNT_EMAIL = process.env.MEGA_ACCOUNT_EMAIL || ""
 const GOOGLE_OAUTH_SCOPE = ["openid", "email", "profile", "https://www.googleapis.com/auth/drive"].join(" ")
@@ -66,10 +124,29 @@ const sessions = new Map()
 const SESSION_COOKIE_NAME = "md_sid"
 const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000
 const SESSION_CLEANUP_MS = 60 * 60 * 1000
-const UPSTASH_REDIS_REST_URL = String(process.env.UPSTASH_REDIS_REST_URL || "").trim()
+const UPSTASH_REDIS_REST_URL = String(process.env.UPSTASH_REDIS_REST_URL || "").trim().replace(/\/+$/, "")
 const UPSTASH_REDIS_REST_TOKEN = String(process.env.UPSTASH_REDIS_REST_TOKEN || "").trim()
 const HAS_UPSTASH = !!(UPSTASH_REDIS_REST_URL && UPSTASH_REDIS_REST_TOKEN)
 const SESSION_KEY_PREFIX = "multidrive:sess:"
+
+//Vercel (and any other serverless host) throws the whole node process away between
+//requests, so anything kept only in module memory is gone by the next request.
+//that is why HAS_UPSTASH is mandatory there: without it accounts vanish the moment
+//the OAuth redirect lands on a different lambda instance.
+const IS_SERVERLESS = !!(process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME || process.env.NOW_REGION)
+const STORAGE_ACCOUNT_TIMEOUT_MS = Number(process.env.STORAGE_ACCOUNT_TIMEOUT_MS || 7000)
+//kept just under the 10s function limit of the Vercel hobby plan so the browser gets a
+//readable JSON error instead of the platform's HTML timeout page.
+const MEGA_LOGIN_TIMEOUT_MS = Number(process.env.MEGA_LOGIN_TIMEOUT_MS || (IS_SERVERLESS ? 9000 : 60000))
+const GOOGLE_TOKEN_SKEW_MS = 60 * 1000
+
+if (IS_SERVERLESS && !HAS_UPSTASH) {
+  console.error(
+    "[multi-drive] FATAL CONFIG: running on a serverless host without UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN. " +
+    "Sessions will be stored in per-instance memory and connected accounts will disappear between requests. " +
+    "Set both env vars in the Vercel project settings and redeploy."
+  )
+}
 
 function parseCookies(header) {
   const out = {}
@@ -113,9 +190,16 @@ function sanitizeAccountForStore(account) {
       megaSessionToken: typeof account.megaSessionToken === "string" ? account.megaSessionToken : ""
     }
   }
+  //keep the refresh token plus the user's own oauth client credentials: a Google
+  //access token dies after ~1 hour and without these three fields the account can
+  //never be refreshed, which is what made cards silently disappear.
   return {
     ...base,
-    token: typeof account.token === "string" ? account.token : ""
+    token: typeof account.token === "string" ? account.token : "",
+    refreshToken: typeof account.refreshToken === "string" ? account.refreshToken : "",
+    clientId: typeof account.clientId === "string" ? account.clientId : "",
+    clientSecret: typeof account.clientSecret === "string" ? account.clientSecret : "",
+    expiresAt: Number(account.expiresAt || 0) || 0
   }
 }
 
@@ -147,6 +231,8 @@ function sanitizeSessionForStore(session) {
   }
 }
 
+const REDIS_TIMEOUT_MS = 5000
+
 async function redisSetJson(key, value, ttlSec) {
   const url = `${UPSTASH_REDIS_REST_URL}/set/${encodeURIComponent(key)}`
   await axios.post(url, value, {
@@ -154,14 +240,16 @@ async function redisSetJson(key, value, ttlSec) {
       Authorization: `Bearer ${UPSTASH_REDIS_REST_TOKEN}`,
       "Content-Type": "application/json"
     },
-    params: { EX: String(ttlSec) }
+    params: { EX: String(ttlSec) },
+    timeout: REDIS_TIMEOUT_MS
   })
 }
 
 async function redisGetJson(key) {
   const url = `${UPSTASH_REDIS_REST_URL}/get/${encodeURIComponent(key)}`
   const response = await axios.get(url, {
-    headers: { Authorization: `Bearer ${UPSTASH_REDIS_REST_TOKEN}` }
+    headers: { Authorization: `Bearer ${UPSTASH_REDIS_REST_TOKEN}` },
+    timeout: REDIS_TIMEOUT_MS
   })
   const value = response?.data?.result
   if (!value) return null
@@ -175,55 +263,111 @@ async function redisGetJson(key) {
 async function redisDel(key) {
   const url = `${UPSTASH_REDIS_REST_URL}/del/${encodeURIComponent(key)}`
   await axios.post(url, null, {
-    headers: { Authorization: `Bearer ${UPSTASH_REDIS_REST_TOKEN}` }
+    headers: { Authorization: `Bearer ${UPSTASH_REDIS_REST_TOKEN}` },
+    timeout: REDIS_TIMEOUT_MS
   })
 }
 
 async function loadSessionById(sid) {
   if (!sid) return null
   if (!HAS_UPSTASH) return sessions.get(sid) || null
-  const payload = await redisGetJson(SESSION_KEY_PREFIX + sid)
-  if (!payload || typeof payload !== "object") return null
-  return sanitizeSessionForStore(payload)
+
+  try {
+    const payload = await redisGetJson(SESSION_KEY_PREFIX + sid)
+    if (!payload || typeof payload !== "object") {
+      //not in Redis (expired or never written). the in-memory mirror can still have
+      //it when the same warm instance handled the write.
+      return sessions.get(sid) || null
+    }
+    const safe = sanitizeSessionForStore(payload)
+    sessions.set(sid, safe)
+    return safe
+  } catch (err) {
+    //never turn a Redis hiccup into a 500 for the whole site.
+    console.error("[multi-drive] session load failed:", err.response?.data || err.message)
+    return sessions.get(sid) || null
+  }
 }
 
 async function saveSession(session) {
   if (!session || !session.id) return
   const safe = sanitizeSessionForStore(session)
-  if (!HAS_UPSTASH) {
-    sessions.set(safe.id, safe)
-    return
+  //always keep the memory mirror so a warm instance survives a Redis outage.
+  sessions.set(safe.id, safe)
+  if (!HAS_UPSTASH) return
+
+  try {
+    await redisSetJson(SESSION_KEY_PREFIX + safe.id, safe, Math.floor(SESSION_TTL_MS / 1000))
+  } catch (err) {
+    console.error("[multi-drive] session save failed:", err.response?.data || err.message)
+    throw err
   }
-  await redisSetJson(SESSION_KEY_PREFIX + safe.id, safe, Math.floor(SESSION_TTL_MS / 1000))
+}
+
+function buildSessionCookie(req, sid) {
+  const parts = [
+    `${SESSION_COOKIE_NAME}=${encodeURIComponent(sid)}`,
+    "Path=/",
+    "HttpOnly",
+    //Lax is required (not Strict): the Google OAuth callback is a cross-site
+    //top-level redirect and a Strict cookie would not be sent with it, which loses
+    //the oauth state and the freshly connected account.
+    "SameSite=Lax",
+    `Max-Age=${Math.floor(SESSION_TTL_MS / 1000)}`
+  ]
+  const proto = String(req.headers["x-forwarded-proto"] || req.protocol || "").split(",")[0].trim()
+  if (proto === "https") parts.push("Secure")
+  return parts.join("; ")
+}
+
+//content fingerprint, ignoring lastSeenAt. used to skip pointless writes: the Upstash
+//free tier has a daily command budget, and once it is exhausted every session write
+//fails - which looks exactly like "the site forgot my accounts".
+const SESSION_TOUCH_INTERVAL_MS = 24 * 60 * 60 * 1000
+
+function sessionFingerprint(session) {
+  const safe = sanitizeSessionForStore(session)
+  safe.lastSeenAt = 0
+  return JSON.stringify(safe)
 }
 
 async function getOrCreateSession(req, res) {
   const cookies = parseCookies(req.headers?.cookie)
   let sid = String(cookies[SESSION_COOKIE_NAME] || "").trim()
   let session = sid ? await loadSessionById(sid) : null
+  const isNewSession = !session
 
   if (!session) {
     sid = makeSessionId()
     session = createEmptySession(sid)
-    const cookieParts = [
-      `${SESSION_COOKIE_NAME}=${encodeURIComponent(sid)}`,
-      "Path=/",
-      "HttpOnly",
-      "SameSite=Lax",
-      `Max-Age=${Math.floor(SESSION_TTL_MS / 1000)}`
-    ]
-    if ((req.headers["x-forwarded-proto"] || req.protocol) === "https") {
-      cookieParts.push("Secure")
-    }
-    res.setHeader("Set-Cookie", cookieParts.join("; "))
   }
+  const loadedFingerprint = sessionFingerprint(session)
+  const loadedLastSeenAt = Number(session.lastSeenAt || 0)
   session.lastSeenAt = Date.now()
+
+  //re-send the cookie on every request, not only on creation, so the 30 day window
+  //keeps sliding and a browser that dropped the cookie gets it back.
+  res.append("Set-Cookie", buildSessionCookie(req, sid))
 
   req.sessionId = sid
   req.userSession = session
-  req.saveUserSession = async () => {
+  req.saveUserSession = async (options = {}) => {
+    const changed = sessionFingerprint(req.userSession) !== loadedFingerprint
+    const stale = Date.now() - loadedLastSeenAt > SESSION_TOUCH_INTERVAL_MS
+    if (!options.force && !changed && !stale) return
     req.userSession.lastSeenAt = Date.now()
     await saveSession(req.userSession)
+  }
+
+  if (isNewSession) {
+    //persist immediately. on Vercel the lambda can be frozen the instant the response
+    //is flushed, so a save queued on res "finish" is not guaranteed to run - and an
+    //unsaved session id means the very next request starts over with an empty account list.
+    try {
+      await saveSession(session)
+    } catch (e) {
+      //already logged in saveSession; the memory mirror still holds it.
+    }
   }
 }
 
@@ -317,6 +461,99 @@ function exportSessionAccountsForClient(session) {
       token: typeof account.token === "string" ? account.token : ""
     }
   }).filter((item) => item.email && item.provider)
+}
+
+//run a promise with a hard deadline. serverless functions get killed by the platform
+//(10s on the Vercel hobby plan) and a killed function returns an HTML error page that
+//the front end cannot parse, so every slow call needs its own budget.
+function withTimeout(promise, ms, label) {
+  let timer = null
+  const guard = new Promise((_resolve, reject) => {
+    timer = setTimeout(() => {
+      const err = new Error(`${label || "Operation"} timed out after ${ms}ms`)
+      err.isTimeout = true
+      reject(err)
+    }, ms)
+    if (typeof timer.unref === "function") timer.unref()
+  })
+  return Promise.race([promise, guard]).finally(() => {
+    if (timer) clearTimeout(timer)
+  })
+}
+
+function isGoogleAccount(account) {
+  return normalizeProvider(account?.provider) === "google"
+}
+
+function googleTokenLooksExpired(account) {
+  const expiresAt = Number(account?.expiresAt || 0)
+  if (!expiresAt) return false
+  return Date.now() + GOOGLE_TOKEN_SKEW_MS >= expiresAt
+}
+
+function sessionNeedsGoogleRefresh(session) {
+  const accounts = Array.isArray(session?.accounts) ? session.accounts : []
+  return accounts.some((account) => {
+    if (!isGoogleAccount(account)) return false
+    if (!account.refreshToken || !account.clientId || !account.clientSecret) return false
+    return googleTokenLooksExpired(account) || !account.token
+  })
+}
+
+//Google access tokens live for about an hour. the refresh token plus the user's own
+//oauth client id/secret are stored with the account so the server can mint a new one
+//instead of showing an empty home screen.
+async function refreshGoogleAccount(account) {
+  if (!isGoogleAccount(account)) return false
+  if (!account.refreshToken || !account.clientId || !account.clientSecret) return false
+
+  const body = new URLSearchParams({
+    client_id: account.clientId,
+    client_secret: account.clientSecret,
+    refresh_token: account.refreshToken,
+    grant_type: "refresh_token"
+  })
+
+  const response = await axios.post(GOOGLE_TOKEN_URL, body.toString(), {
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    timeout: 10000
+  })
+
+  const accessToken = response.data?.access_token
+  if (!accessToken) return false
+
+  account.token = accessToken
+  account.expiresAt = Date.now() + (Number(response.data?.expires_in || 3600) * 1000)
+  if (typeof response.data?.refresh_token === "string" && response.data.refresh_token) {
+    account.refreshToken = response.data.refresh_token
+  }
+  return true
+}
+
+async function ensureFreshGoogleTokens(req) {
+  const session = req?.userSession
+  if (!session || !sessionNeedsGoogleRefresh(session)) return
+
+  const accounts = Array.isArray(session.accounts) ? session.accounts : []
+  let changed = false
+
+  await Promise.all(accounts.map(async (account) => {
+    if (!isGoogleAccount(account)) return
+    if (!googleTokenLooksExpired(account) && account.token) return
+    try {
+      if (await refreshGoogleAccount(account)) changed = true
+    } catch (err) {
+      logError(err)
+      //leave the stale token in place; the per-account error path reports it as
+      //"reconnect needed" instead of hiding the whole account list.
+    }
+  }))
+
+  if (changed && typeof req.saveUserSession === "function") {
+    try {
+      await req.saveUserSession()
+    } catch (e) { }
+  }
 }
 
 function parseMegaSessionToken(raw) {
@@ -414,8 +651,9 @@ function getQueryTrimmed(req, key) {
 
 function resolveRedirectUri(req) {
   if (REDIRECT_URI) return REDIRECT_URI
-  const proto = req.headers["x-forwarded-proto"] || req.protocol || "http"
-  const host = req.headers["x-forwarded-host"] || req.get("host")
+  //x-forwarded-* can be a comma separated chain behind more than one proxy.
+  const proto = String(req.headers["x-forwarded-proto"] || req.protocol || "http").split(",")[0].trim()
+  const host = String(req.headers["x-forwarded-host"] || req.get("host") || "").split(",")[0].trim()
   return `${proto}://${host}/auth/google/callback`
 }
 
@@ -470,36 +708,130 @@ function getMegaNodeById(storage, nodeId) {
   return storage.files[nodeId] || null
 }
 
-async function ensureMegaStorageForAccount(account) {
+//megajs keeps a "keepalive" long poll open after every request (api.pull -> api.wait).
+//on a serverless host that socket never closes, the function is billed until the
+//platform freezes it, and when the frozen socket finally errors megajs emits an
+//"error" event on an EventEmitter nobody listens to - which crashes the whole
+//instance and makes unrelated requests fail with a 500. So: keepalive off, and an
+//error listener on the api object as a second line of defence.
+function hardenMegaStorage(storage) {
+  if (!storage) return storage
+  try {
+    if (storage.options) storage.options.keepalive = false
+    if (storage.api) {
+      storage.api.keepalive = false
+      if (typeof storage.api.on === "function" && storage.api.listenerCount("error") === 0) {
+        storage.api.on("error", (err) => {
+          console.error("[multi-drive] mega api error:", err?.message || err)
+        })
+      }
+    }
+    if (typeof storage.on === "function" && storage.listenerCount("error") === 0) {
+      storage.on("error", (err) => {
+        console.error("[multi-drive] mega storage error:", err?.message || err)
+      })
+    }
+  } catch (e) { }
+  return storage
+}
+
+//storage.toJSON() carries the raw login options (email, and on some paths the
+//password / 2FA code). Only the key + sid are needed to resume a session, so strip
+//the credentials before this string is written to Redis or handed to the browser.
+function serializeMegaStorage(storage) {
+  if (!storage || typeof storage.toJSON !== "function") return ""
+  try {
+    const snapshot = storage.toJSON()
+    const options = { ...(snapshot.options || {}) }
+    delete options.password
+    delete options.secondFactorCode
+    delete options.email
+    options.keepalive = false
+    options.autoload = false
+    options.autologin = false
+    return JSON.stringify({ ...snapshot, options })
+  } catch (e) {
+    return ""
+  }
+}
+
+//a warm instance can reuse an already logged in storage instead of re-doing the
+//MEGA handshake and full tree download on every single request.
+const megaStorageCache = new Map()
+const MEGA_STORAGE_CACHE_MAX = 5
+
+function cacheKeyForMegaAccount(account) {
+  const token = typeof account?.megaSessionToken === "string" ? account.megaSessionToken : ""
+  if (!token) return ""
+  return crypto.createHash("sha256").update(token).digest("hex")
+}
+
+function getCachedMegaStorage(account) {
+  const key = cacheKeyForMegaAccount(account)
+  if (!key) return null
+  const entry = megaStorageCache.get(key)
+  if (!entry) return null
+  megaStorageCache.delete(key)
+  megaStorageCache.set(key, entry)
+  return entry
+}
+
+function setCachedMegaStorage(account, storage, treeLoaded) {
+  const key = cacheKeyForMegaAccount(account)
+  if (!key || !storage) return
+  megaStorageCache.set(key, { storage, treeLoaded: !!treeLoaded })
+  while (megaStorageCache.size > MEGA_STORAGE_CACHE_MAX) {
+    const oldest = megaStorageCache.keys().next().value
+    megaStorageCache.delete(oldest)
+  }
+}
+
+//needTree: only pay for the full file tree download when the caller actually browses
+//files. /storage just needs the quota (api "uq"), which works with the sid alone.
+async function ensureMegaStorageForAccount(account, options = {}) {
+  const needTree = options.needTree !== false
   if (!account || normalizeProvider(account.provider) !== "mega") {
     throw new Error("Invalid MEGA account")
   }
 
-  const tryReload = async (storage) => {
-    if (!storage) return null
-    await storage.reload(true)
-    storage.status = "ready"
+  const finish = async (storage) => {
+    hardenMegaStorage(storage)
+    if (needTree) {
+      //the tree is re-read whenever a caller needs it, so browsing never shows a
+      //stale listing. what the cache saves is the session handshake, not the listing.
+      await storage.reload(true)
+      storage.status = "ready"
+    }
+    account.storage = storage
+    setCachedMegaStorage(account, storage, needTree)
     return storage
   }
 
-  try {
-    const live = await tryReload(account.storage)
-    if (live) {
-      account.storage = live
-      return live
+  if (account.storage) {
+    try {
+      return await finish(account.storage)
+    } catch (e) {
+      account.storage = null
     }
-  } catch (e) {
-    account.storage = null
+  }
+
+  const cached = getCachedMegaStorage(account)
+  if (cached && cached.storage) {
+    try {
+      return await finish(cached.storage)
+    } catch (e) {
+      megaStorageCache.delete(cacheKeyForMegaAccount(account))
+    }
   }
 
   const rawSession = account.megaSessionToken
   const parsed = typeof rawSession === "string" ? parseMegaSessionToken(rawSession) : null
   if (parsed) {
-    const restored = mega.Storage.fromJSON(parsed)
-    await restored.reload(true)
-    restored.status = "ready"
-    account.storage = restored
-    return restored
+    const restored = mega.Storage.fromJSON({
+      ...parsed,
+      options: { ...(parsed.options || {}), keepalive: false, autoload: false, autologin: false }
+    })
+    return await finish(restored)
   }
 
   if (MEGA_SESSION_TOKEN) {
@@ -536,7 +868,11 @@ async function getMegaStorage() {
     throw new Error("MEGA_SESSION_TOKEN is missing or invalid. Use JSON from storage.toJSON() or its base64.")
   }
 
-  const storage = mega.Storage.fromJSON(parsed)
+  const storage = mega.Storage.fromJSON({
+    ...parsed,
+    options: { ...(parsed.options || {}), keepalive: false, autoload: false, autologin: false }
+  })
+  hardenMegaStorage(storage)
   await storage.reload(true)
   storage.status = "ready"
   megaStorage = storage
@@ -546,12 +882,11 @@ async function getMegaStorage() {
 async function connectMegaAccount(session) {
   const storage = await getMegaStorage()
   const email = buildMegaEmail(storage)
-  const snapshot = storage.toJSON ? storage.toJSON() : null
   upsertAccount(session, {
     provider: "mega",
     email,
     storage,
-    megaSessionToken: snapshot ? JSON.stringify(snapshot) : MEGA_SESSION_TOKEN
+    megaSessionToken: serializeMegaStorage(storage) || MEGA_SESSION_TOKEN
   })
   return email
 }
@@ -566,18 +901,27 @@ async function connectMegaAccountWithCredentials(session, { email, password, sec
     password: String(password),
     secondFactorCode: secondFactorCode ? String(secondFactorCode).trim() : undefined,
     autoload: true,
-    autologin: true
+    autologin: true,
+    //no background long poll: see hardenMegaStorage for why this matters on Vercel.
+    keepalive: false
   })
+  hardenMegaStorage(storage)
 
-  await storage.ready
+  //MEGA login + first tree download is the slowest thing this app does. give it a
+  //deadline so the request answers with a real error instead of being killed by the
+  //platform (which returns an HTML page the front end cannot parse).
+  await withTimeout(storage.ready, MEGA_LOGIN_TIMEOUT_MS, "MEGA login")
+  hardenMegaStorage(storage)
+
   const accountEmail = normalizeEmail(email)
-  const snapshot = storage.toJSON ? storage.toJSON() : null
-  upsertAccount(session, {
+  const account = {
     provider: "mega",
     email: accountEmail,
     storage,
-    megaSessionToken: snapshot ? JSON.stringify(snapshot) : ""
-  })
+    megaSessionToken: serializeMegaStorage(storage)
+  }
+  upsertAccount(session, account)
+  setCachedMegaStorage(account, storage, true)
   return accountEmail
 }
 
@@ -742,8 +1086,10 @@ app.post("/auth/google/start", async (req, res) => {
   }
 })
 
+//there is no /mega-login.html in public/ (the MEGA form lives in a modal on the home
+//page), so these used to redirect the user straight into a 404.
 app.get("/auth/mega", (req, res) => {
-  res.redirect("/mega-login.html")
+  res.redirect("/?connect=mega")
 })
 
 app.post("/auth/mega/login", async (req, res) => {
@@ -755,8 +1101,9 @@ app.post("/auth/mega/login", async (req, res) => {
     await req.saveUserSession()
     res.redirect("/")
   } catch (err) {
+    logError(err)
     const msg = err && err.message ? err.message : "Unable to login to MEGA"
-    res.redirect("/mega-login.html?error=" + encodeURIComponent(msg))
+    res.redirect("/?connect=mega&error=" + encodeURIComponent(msg))
   }
 })
 
@@ -781,8 +1128,9 @@ app.post("/auth/mega/token", (req, res) => {
       res.redirect("/")
     })
     .catch((err) => {
+      logError(err)
       const msg = encodeURIComponent(err && err.message ? err.message : "Unable to connect MEGA token")
-      res.redirect("/mega-login.html?error=" + msg)
+      res.redirect("/?connect=mega&error=" + msg)
     })
 })
 
@@ -801,16 +1149,23 @@ app.get("/auth/google/callback", async (req, res) => {
   try {
     const code = req.query.code
     const state = getQueryTrimmed(req, "state")
+    const googleError = getQueryTrimmed(req, "error")
+    if (googleError) {
+      return res.redirect("/?connectError=" + encodeURIComponent("Google returned: " + googleError))
+    }
     cleanupOAuthStates(req.userSession)
 
     const oauthStates = req.userSession.oauthStates || {}
     if (!state || !oauthStates[state]) {
-      return res.status(400).send("OAuth session expired. Start Google sign-in again.")
+      //this is the "cookie or session was lost between the two requests" case. saying
+      //so plainly beats a bare 400 page.
+      return res.redirect("/?connectError=" + encodeURIComponent(
+        "Google sign-in session expired before the redirect came back. Start the Google connect step again."
+      ))
     }
     const stateData = oauthStates[state]
     delete oauthStates[state]
     req.userSession.oauthStates = oauthStates
-    await req.saveUserSession()
     const oauthClientId = stateData.clientId
     const oauthClientSecret = stateData.clientSecret
     const oauthRedirectUri = stateData.redirectUri || resolveRedirectUri(req)
@@ -821,89 +1176,187 @@ app.get("/auth/google/callback", async (req, res) => {
       client_secret: oauthClientSecret,
       redirect_uri: oauthRedirectUri,
       grant_type: "authorization_code"
-    })
+    }, { timeout: 15000 })
 
     const accessToken = tokenResponse.data.access_token
     const profileResponse = await axios.get(GOOGLE_PROFILE_URL, {
-      headers: authHeaders(accessToken)
+      headers: authHeaders(accessToken),
+      timeout: 15000
     })
 
+    //the refresh token and the user's own client id/secret are stored with the account
+    //so the access token can be renewed later. without them the account went dark
+    //(and looked "disconnected") about an hour after connecting.
     upsertAccount(req.userSession, {
       provider: "google",
       email: profileResponse.data.email,
-      token: accessToken
+      token: accessToken,
+      refreshToken: typeof tokenResponse.data.refresh_token === "string" ? tokenResponse.data.refresh_token : "",
+      clientId: oauthClientId,
+      clientSecret: oauthClientSecret,
+      expiresAt: Date.now() + (Number(tokenResponse.data.expires_in || 3600) * 1000)
     })
+
+    //one single save that persists both the consumed oauth state and the new account.
+    //it must complete BEFORE the redirect: on Vercel the instance can be frozen as
+    //soon as the response is flushed, so a save left running in the background may
+    //never reach Redis and the home page would come back with zero accounts.
     await req.saveUserSession()
 
-    console.log("Google account connected")
-    res.redirect("/")
+    console.log("Google account connected:", normalizeEmail(profileResponse.data.email))
+    res.redirect("/?connected=google")
   } catch (err) {
     logError(err)
-    res.send("OAuth Error")
+    const detail = err.response?.data?.error_description || err.response?.data?.error || err.message || "unknown error"
+    res.redirect("/?connectError=" + encodeURIComponent("Google connect failed: " + String(detail).slice(0, 300)))
   }
 })
+
+//one card per connected account.
+//every account is resolved independently, in parallel, behind its own timeout, and a
+//failing account becomes a card with an error instead of taking the whole response
+//down. the old version bailed out to res.send("Error fetching storage info") - a
+//200 with a text/html body - so the browser's res.json() threw and the home screen
+//rendered "no connected accounts" even though the session had accounts in it.
+async function buildMegaStorageCard(account) {
+  const storage = await ensureMegaStorageForAccount(account, { needTree: false })
+  const info = await storage.getAccountInfo()
+  const email = account.email || buildMegaEmail(storage)
+  const givenName = getFirstNameFromEmail(email)
+
+  //MEGA rotates its session id, so keep the stored token in step with the live one.
+  const refreshedToken = serializeMegaStorage(storage)
+  const tokenChanged = !!refreshedToken && refreshedToken !== account.megaSessionToken
+  if (tokenChanged) account.megaSessionToken = refreshedToken
+
+  return {
+    card: {
+      provider: "mega",
+      user: {
+        emailAddress: email,
+        displayName: givenName || "MEGA",
+        givenName,
+        photoLink: ""
+      },
+      storageQuota: {
+        usage: Number(info.spaceUsed || 0),
+        limit: Number(info.spaceTotal || 0),
+        usageInDrive: Number(info.spaceUsed || 0),
+        usageInDriveTrash: 0
+      }
+    },
+    sessionChanged: tokenChanged
+  }
+}
+
+async function buildGoogleStorageCard(account) {
+  let sessionChanged = false
+
+  const load = async () => Promise.all([
+    axios.get(DRIVE_ABOUT_URL, { headers: authHeaders(account.token), timeout: STORAGE_ACCOUNT_TIMEOUT_MS }),
+    axios.get(GOOGLE_PROFILE_URL, { headers: authHeaders(account.token), timeout: STORAGE_ACCOUNT_TIMEOUT_MS })
+  ])
+
+  let responses
+  try {
+    responses = await load()
+  } catch (err) {
+    //401/403 means the access token died. try exactly one refresh before giving up.
+    const status = err.response?.status
+    const canRetry = (status === 401 || status === 403) && !!account.refreshToken
+    if (!canRetry) throw err
+    if (!(await refreshGoogleAccount(account))) throw err
+    sessionChanged = true
+    responses = await load()
+  }
+
+  const [driveResponse, profileResponse] = responses
+  const driveUser = driveResponse.data.user || {}
+  const profile = profileResponse.data || {}
+  const email = driveUser.emailAddress || profile.email || account.email
+  const displayName = driveUser.displayName || profile.name || ""
+
+  return {
+    card: {
+      provider: "google",
+      ...driveResponse.data,
+      user: {
+        ...driveUser,
+        emailAddress: email,
+        displayName,
+        givenName: profile.given_name || getFirstNameFromDisplayName(displayName) || getFirstNameFromEmail(email),
+        photoLink: driveUser.photoLink || profile.picture
+      }
+    },
+    sessionChanged
+  }
+}
+
+function buildFailedStorageCard(account, err) {
+  const provider = normalizeProvider(account.provider) || "google"
+  const email = normalizeEmail(account.email)
+  const status = err?.response?.status || 0
+  const needsReauth = status === 401 || status === 403 || /session expired|invalid_grant|reconnect/i.test(String(err?.message || ""))
+  const givenName = getFirstNameFromEmail(email)
+
+  return {
+    provider,
+    error: err?.isTimeout
+      ? "This account took too long to answer. Reload to try again."
+      : (err?.response?.data?.error?.message || err?.message || "Unable to read this account right now."),
+    needsReauth,
+    user: {
+      emailAddress: email,
+      displayName: givenName || (provider === "mega" ? "MEGA" : "Google Drive"),
+      givenName,
+      photoLink: ""
+    },
+    //always present so the front end can render the card without optional chaining.
+    storageQuota: {
+      usage: 0,
+      limit: 0,
+      usageInDrive: 0,
+      usageInDriveTrash: 0
+    }
+  }
+}
 
 app.get("/storage", async (req, res) => {
   try {
-    const results = []
+    await ensureFreshGoogleTokens(req)
 
     const sessionAccounts = Array.isArray(req.userSession.accounts) ? req.userSession.accounts : []
-    for (const account of sessionAccounts) {
-      if (account.provider === "mega") {
-        const storage = await ensureMegaStorageForAccount(account)
-        const info = await storage.getAccountInfo()
-        const email = account.email || buildMegaEmail(storage)
-        const givenName = getFirstNameFromEmail(email)
+    let sessionChanged = false
 
-        results.push({
-          provider: "mega",
-          user: {
-            emailAddress: email,
-            displayName: givenName || "MEGA",
-            givenName,
-            photoLink: ""
-          },
-          storageQuota: {
-            usage: Number(info.spaceUsed || 0),
-            limit: Number(info.spaceTotal || 0),
-            usageInDrive: Number(info.spaceUsed || 0),
-            usageInDriveTrash: 0
-          }
-        })
-        continue
+    const settled = await Promise.all(sessionAccounts.map(async (account) => {
+      try {
+        const build = normalizeProvider(account.provider) === "mega"
+          ? buildMegaStorageCard(account)
+          : buildGoogleStorageCard(account)
+        const result = await withTimeout(build, STORAGE_ACCOUNT_TIMEOUT_MS, `Reading ${account.email}`)
+        if (result.sessionChanged) sessionChanged = true
+        return result.card
+      } catch (err) {
+        console.error(`[multi-drive] /storage failed for ${account.provider}:${account.email}:`, err.response?.data || err.message)
+        return buildFailedStorageCard(account, err)
       }
+    }))
 
-      const [driveResponse, profileResponse] = await Promise.all([
-        axios.get(DRIVE_ABOUT_URL, { headers: authHeaders(account.token) }),
-        axios.get(GOOGLE_PROFILE_URL, { headers: authHeaders(account.token) })
-      ])
-
-      const driveUser = driveResponse.data.user || {}
-      const profile = profileResponse.data || {}
-      const email = driveUser.emailAddress || profile.email
-      const displayName = driveUser.displayName || profile.name || ""
-
-      results.push({
-        provider: "google",
-        ...driveResponse.data,
-        user: {
-          ...driveUser,
-          emailAddress: email,
-          displayName,
-          givenName: profile.given_name || getFirstNameFromDisplayName(displayName) || getFirstNameFromEmail(email),
-          photoLink: driveUser.photoLink || profile.picture
-        }
-      })
+    if (sessionChanged) {
+      try {
+        await req.saveUserSession()
+      } catch (e) { }
     }
 
-    res.json(results)
+    res.json(settled)
   } catch (err) {
     logError(err)
-    res.send("Error fetching storage info")
+    //still JSON, still an array-shaped failure the client can reason about.
+    res.status(500).json({ error: "Error fetching storage info", accounts: [] })
   }
 })
 
-app.post("/logout", (req, res) => {
+app.post("/logout", async (req, res) => {
   const email = req.body?.email
   const provider = normalizeProvider(req.body?.provider)
 
@@ -913,10 +1366,12 @@ app.post("/logout", (req, res) => {
 
   const sessionAccounts = Array.isArray(req.userSession.accounts) ? req.userSession.accounts : []
   const previousLength = sessionAccounts.length
+  const removed = []
   req.userSession.accounts = sessionAccounts.filter((account) => {
     const sameEmail = normalizeEmail(account.email) === normalizeEmail(email)
     if (!sameEmail) return true
-    if (provider) return normalizeProvider(account.provider) !== provider
+    if (provider && normalizeProvider(account.provider) !== provider) return true
+    removed.push(account)
     return false
   })
 
@@ -924,7 +1379,18 @@ app.post("/logout", (req, res) => {
     return res.status(404).json({ error: "Account not found" })
   }
 
-  req.saveUserSession().catch(() => { })
+  //drop the warm MEGA session too, otherwise a re-login on the same instance keeps
+  //talking to the old cached storage object.
+  for (const account of removed) {
+    const key = cacheKeyForMegaAccount(account)
+    if (key) megaStorageCache.delete(key)
+  }
+
+  //await it: on serverless a background save can be frozen before it lands, which
+  //makes a removed account reappear on the next page load.
+  try {
+    await req.saveUserSession()
+  } catch (e) { }
   res.json({ success: true })
 })
 
@@ -937,14 +1403,27 @@ app.get("/session/export", (req, res) => {
   }
 })
 
+//the browser keeps a copy of its accounts in localStorage as a safety net for a lost
+//cookie. that copy is always older than the server's, so it may only ADD accounts the
+//session does not have - never overwrite one that is already there. the previous
+//version overwrote unconditionally, so the page load right after a successful Google
+//connect replaced the brand new access token with a stale cached one, every /storage
+//call then 401'd, and the freshly connected account never appeared.
 app.post("/session/restore", async (req, res) => {
   try {
     const source = Array.isArray(req.body?.accounts) ? req.body.accounts : []
     const restored = []
+    const skipped = []
+
     for (const raw of source) {
       const provider = normalizeProvider(raw?.provider)
       const email = normalizeEmail(raw?.email)
       if (!provider || !email) continue
+
+      if (getAccountByEmail(req.userSession, email, provider)) {
+        skipped.push({ provider, email })
+        continue
+      }
 
       if (provider === "mega") {
         const megaSessionToken = typeof raw?.megaSessionToken === "string" ? raw.megaSessionToken.trim() : ""
@@ -968,12 +1447,31 @@ app.post("/session/restore", async (req, res) => {
       restored.push({ provider: "google", email })
     }
 
-    await req.saveUserSession()
-    return res.json({ success: true, restored })
+    if (restored.length) {
+      await req.saveUserSession()
+    }
+    return res.json({ success: true, restored, skipped })
   } catch (err) {
     logError(err)
     return res.status(500).json({ error: "Unable to restore session" })
   }
+})
+
+//safe to expose: says whether sessions can survive between requests, without leaking
+//any credential. this is the first thing to check when the deployed site "forgets"
+//accounts but localhost does not.
+app.get("/health", (req, res) => {
+  res.json({
+    ok: true,
+    serverless: IS_SERVERLESS,
+    sessionStore: HAS_UPSTASH ? "upstash-redis" : "in-memory",
+    sessionsSurviveRestarts: HAS_UPSTASH,
+    warning: IS_SERVERLESS && !HAS_UPSTASH
+      ? "Serverless host without Upstash: connected accounts will not survive between requests. Set UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN."
+      : null,
+    googleOauthRedirectUri: resolveRedirectUri(req),
+    accountsInThisSession: Array.isArray(req.userSession?.accounts) ? req.userSession.accounts.length : 0
+  })
 })
 
 app.get("/files", async (req, res) => {
@@ -992,7 +1490,8 @@ app.get("/files", async (req, res) => {
     }
 
     if (account.provider === "mega") {
-      const items = await listMegaChildren(await ensureMegaStorageForAccount(account), parentId)
+      //needTree:false - listMegaChildren does its own reload.
+      const items = await listMegaChildren(await ensureMegaStorageForAccount(account, { needTree: false }), parentId)
       return res.json({ parentId, items })
     }
 
@@ -1025,7 +1524,6 @@ app.get("/open-file", async (req, res) => {
 
     if (account.provider === "mega") {
       const storage = await ensureMegaStorageForAccount(account)
-      await storage.reload(true)
       const node = getMegaNodeById(storage, fileId)
       if (!node) {
         return res.status(404).json({ error: "File not found" })
@@ -1072,8 +1570,8 @@ app.get("/search", async (req, res) => {
 
     const tasks = sessionAccounts.map(async (account) => {
       if (account.provider === "mega") {
+        //ensureMegaStorageForAccount already reloads the tree when needTree is on.
         const storage = await ensureMegaStorageForAccount(account)
-        await storage.reload(true)
         const needle = query.toLowerCase()
 
         return (storage.filter(() => true, true) || [])
@@ -1106,8 +1604,30 @@ app.get("/search", async (req, res) => {
       }))
     })
 
-    const perAccountResults = await Promise.all(tasks)
-    res.json({ query, results: perAccountResults.flat() })
+    //one dead account must not wipe out the results of the healthy ones, so failures
+    //are collected and reported next to the hits instead of rejecting the request.
+    const settled = await Promise.allSettled(
+      tasks.map((task, index) => withTimeout(task, STORAGE_ACCOUNT_TIMEOUT_MS, `Searching ${sessionAccounts[index]?.email}`))
+    )
+
+    const results = []
+    const failed = []
+    settled.forEach((item, index) => {
+      const account = sessionAccounts[index] || {}
+      if (item.status === "fulfilled") {
+        results.push(...(Array.isArray(item.value) ? item.value : []))
+        return
+      }
+      const err = item.reason
+      console.error(`[multi-drive] /search failed for ${account.provider}:${account.email}:`, err?.response?.data || err?.message)
+      failed.push({
+        provider: normalizeProvider(account.provider),
+        email: normalizeEmail(account.email),
+        error: err?.isTimeout ? "Timed out" : (err?.response?.data?.error?.message || err?.message || "Search failed")
+      })
+    })
+
+    res.json({ query, results, failed })
   } catch (err) {
     sendErrorJson(res, err, "Error searching files")
   }
@@ -1161,7 +1681,6 @@ app.post("/copy-item", async (req, res) => {
 
     if (account.provider === "mega") {
       const storage = await ensureMegaStorageForAccount(account)
-      await storage.reload(true)
       const source = getMegaNodeById(storage, fileId)
       const target = destinationFolderId === "root" ? storage.root : getMegaNodeById(storage, destinationFolderId)
       if (!source || !target || !target.directory) {
@@ -1207,7 +1726,6 @@ app.post("/move-item", async (req, res) => {
 
     if (account.provider === "mega") {
       const storage = await ensureMegaStorageForAccount(account)
-      await storage.reload(true)
       const source = getMegaNodeById(storage, fileId)
       const target = destinationFolderId === "root" ? storage.root : getMegaNodeById(storage, destinationFolderId)
       if (!source || !target || !target.directory) {
@@ -1260,13 +1778,13 @@ app.post("/create-folder", async (req, res) => {
 
     if (account.provider === "mega") {
       const storage = await ensureMegaStorageForAccount(account)
-      await storage.reload(true)
       const targetFolder = parentId === "root" ? storage.root : getMegaNodeById(storage, parentId)
       if (!targetFolder || !targetFolder.directory) {
         return res.status(404).json({ error: "Destination folder not found" })
       }
       const created = await targetFolder.mkdir(folderName)
-      await storage.reload(true)
+      //no second reload: the created node is returned straight away and the next
+      //request re-reads the tree anyway. one less full tree download per folder.
       return res.json({ success: true, item: normalizeMegaNode(created, targetFolder.nodeId || "root") })
     }
 
@@ -1349,7 +1867,6 @@ app.post("/upload-item-stream", async (req, res) => {
     if (account.provider === "mega") {
       try {
         const storage = await ensureMegaStorageForAccount(account)
-        await storage.reload(true)
 
         const targetFolder =
           parentId === "root" ? storage.root : getMegaNodeById(storage, parentId)
@@ -1526,7 +2043,6 @@ app.post("/upload-item", upload.single("file"), async (req, res) => {
 
     if (account.provider === "mega") {
       const storage = await ensureMegaStorageForAccount(account)
-      await storage.reload(true)
       const targetFolder = parentId === "root" ? storage.root : getMegaNodeById(storage, parentId)
       if (!targetFolder || !targetFolder.directory) {
         return res.status(404).json({ error: "Destination folder not found" })
@@ -1664,9 +2180,22 @@ app.use((err, req, res, next) => {
 
 const PORT = Number(process.env.PORT || 3000)
 
+//megajs emits errors on its own EventEmitters (api "error", storage "error") from
+//background sockets. an unhandled one takes the whole process down - on a serverless
+//host that means every other request landing on that instance fails too. log and
+//survive instead.
+process.on("unhandledRejection", (reason) => {
+  console.error("[multi-drive] unhandled rejection:", reason?.message || reason)
+})
+
+process.on("uncaughtException", (err) => {
+  console.error("[multi-drive] uncaught exception:", err?.stack || err?.message || err)
+})
+
 if (require.main === module) {
   app.listen(PORT, () => {
-    console.log(`Server running on http://localhost:3000/`)
+    console.log(`Server running on http://localhost:${PORT}/`)
+    console.log(`Session store: ${HAS_UPSTASH ? "Upstash Redis (shared)" : "in-memory (single process only)"}`)
   })
 }
 

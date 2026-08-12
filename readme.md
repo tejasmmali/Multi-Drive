@@ -23,12 +23,14 @@ Manage multiple Google Drive and Mega accounts from a single interface with opti
 
 ## Important Info
 
-- please try clearing the cache for trobleshoot if account are not showing 
 - Please use localhost for unlimited usage (hosted websites can have storage limits).
 - Supports Google Drive and MEGA accounts
 - Browse, upload, copy/move, create folders, and search across accounts
 - Storage usage is shown per connected account
 - MEGA delete is currently disabled (Google Drive delete works)
+- If an account card shows "Reconnect", that account's access expired - connect it again
+- Deploying it yourself? Read `VERCEL_FIX_NOTES.md` first, it lists the required
+  environment variables and how to verify a deployment
 
 
 

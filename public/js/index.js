@@ -51,9 +51,39 @@ function writeBrowserAccountsCache(accounts) {
   } catch (e) {}
 }
 
+async function syncBrowserAccountsCacheFromServer() {
+  try {
+    const res = await fetch("/session/export", { cache: "no-store" });
+    if (!res.ok) return;
+    const payload = await res.json();
+    writeBrowserAccountsCache(
+      payload && Array.isArray(payload.accounts) ? payload.accounts : [],
+    );
+  } catch (e) {}
+}
+
+// The localStorage copy of the accounts is only a safety net for a lost md_sid cookie.
+// It is always older than what the server has, so it must never be pushed on top of a
+// live session: doing that used to replace a just-issued Google access token with a
+// stale one, every /storage call then failed, and the account that was connected
+// seconds earlier never showed up on the home screen.
 async function restoreSessionFromBrowserCache() {
   const cached = readBrowserAccountsCache();
   if (!cached.length) return;
+
+  try {
+    const res = await fetch("/session/export", { cache: "no-store" });
+    if (res.ok) {
+      const payload = await res.json();
+      const serverAccounts =
+        payload && Array.isArray(payload.accounts) ? payload.accounts : [];
+      // server already knows about accounts - it is the source of truth, leave it alone.
+      if (serverAccounts.length) return;
+    }
+  } catch (e) {
+    // could not ask the server; fall through and try to restore.
+  }
+
   try {
     await fetch("/session/restore", {
       method: "POST",
@@ -63,12 +93,73 @@ async function restoreSessionFromBrowserCache() {
   } catch (e) {}
 }
 
-async function syncBrowserAccountsCacheFromServer() {
+// Small inline banner. Used for OAuth failures handed back on the URL and for accounts
+// that need reconnecting, so those states are visible instead of silently rendering an
+// empty home screen.
+function showConnectNotice(message, isError) {
+  const text = String(message || "").trim();
+  if (!text) return;
+
+  let bar = document.getElementById("connectNoticeBar");
+  if (!bar) {
+    bar = document.createElement("div");
+    bar.id = "connectNoticeBar";
+    bar.setAttribute("role", "status");
+    bar.style.cssText =
+      "position:fixed;left:50%;transform:translateX(-50%);top:16px;z-index:9999;" +
+      "max-width:min(720px,92vw);padding:12px 40px 12px 16px;border-radius:10px;" +
+      "font:14px/1.45 system-ui,sans-serif;box-shadow:0 8px 24px rgba(0,0,0,.18);" +
+      "word-break:break-word;";
+    const close = document.createElement("button");
+    close.type = "button";
+    close.setAttribute("aria-label", "Dismiss message");
+    close.textContent = "×";
+    close.style.cssText =
+      "position:absolute;top:6px;right:10px;background:none;border:0;color:inherit;" +
+      "font-size:20px;line-height:1;cursor:pointer;";
+    close.addEventListener("click", () => bar.remove());
+    bar.appendChild(document.createElement("span"));
+    bar.appendChild(close);
+    document.body.appendChild(bar);
+  }
+
+  bar.style.background = isError ? "#fdecea" : "#e8f4ea";
+  bar.style.color = isError ? "#8a1c14" : "#14532d";
+  bar.style.border = "1px solid " + (isError ? "#f3b7b1" : "#a8d5b5");
+  bar.firstChild.textContent = text;
+
+  window.clearTimeout(showConnectNotice._timer);
+  showConnectNotice._timer = window.setTimeout(() => {
+    if (bar && bar.parentNode) bar.remove();
+  }, isError ? 15000 : 6000);
+}
+
+// Messages the server hands back on a redirect (Google/MEGA connect results).
+function consumeConnectMessagesFromUrl() {
   try {
-    const res = await fetch("/session/export", { cache: "no-store" });
-    const payload = await res.json();
-    writeBrowserAccountsCache(
-      payload && Array.isArray(payload.accounts) ? payload.accounts : [],
+    const params = new URLSearchParams(window.location.search);
+    const error = params.get("connectError") || params.get("error");
+    const connected = params.get("connected");
+    if (!error && !connected) return;
+
+    if (error) showConnectNotice(error, true);
+    else if (connected) {
+      showConnectNotice(
+        connected === "google"
+          ? "Google account connected."
+          : "Account connected.",
+        false,
+      );
+    }
+
+    ["connectError", "error", "connected", "connect"].forEach((key) =>
+      params.delete(key),
+    );
+    const query = params.toString();
+    window.history.replaceState(
+      {},
+      "",
+      window.location.pathname + (query ? "?" + query : ""),
     );
   } catch (e) {}
 }
@@ -2243,6 +2334,26 @@ function setTotalStorageVisibility(accountCount) {
   card.style.display = accountCount > 0 ? "" : "none";
 }
 
+// Turn a cached {provider,email} entry into a card-shaped placeholder so a failed
+// /storage call can still show which accounts are connected.
+function placeholderCardFromCachedAccount(entry) {
+  const email = String(entry?.email || "");
+  const provider = normalizeProvider(entry?.provider);
+  const first = email.includes("@") ? email.split("@")[0] : email;
+  return {
+    provider,
+    error: "Storage details unavailable right now.",
+    needsReauth: false,
+    user: {
+      emailAddress: email,
+      displayName: first || (provider === "mega" ? "MEGA" : "Google Drive"),
+      givenName: first,
+      photoLink: "",
+    },
+    storageQuota: { usage: 0, limit: 0, usageInDrive: 0, usageInDriveTrash: 0 },
+  };
+}
+
 async function loadStorage() {
   const accountsEl = document.getElementById("accounts");
   const cardsEl = document.getElementById("cards");
@@ -2256,12 +2367,40 @@ async function loadStorage() {
   setTotalStorageLoading(true);
   updateTotalStorageSummary(0, 0, 0);
 
+  // A failed request is not the same thing as "no accounts connected". The old code
+  // treated any non-JSON answer (a platform timeout page, a 500, a proxy error) as an
+  // empty account list, which is why a working session could still render the
+  // "please connect" empty state on the hosted site.
   let data = [];
+  let loadFailed = false;
   try {
-    const res = await fetch("/storage", { cache: "no-store" });
-    data = await res.json();
+    const res = await fetch("/storage", {
+      cache: "no-store",
+      credentials: "same-origin",
+    });
+    const contentType = String(res.headers.get("content-type") || "");
+    if (!res.ok || contentType.indexOf("application/json") === -1) {
+      loadFailed = true;
+    } else {
+      const payload = await res.json();
+      if (Array.isArray(payload)) {
+        data = payload;
+      } else if (payload && Array.isArray(payload.accounts)) {
+        data = payload.accounts;
+      } else {
+        loadFailed = true;
+      }
+    }
   } catch (e) {
-    data = [];
+    loadFailed = true;
+  }
+
+  if (loadFailed) {
+    data = readBrowserAccountsCache().map(placeholderCardFromCachedAccount);
+    showConnectNotice(
+      "Could not read your accounts from the server. Reload the page to try again.",
+      true,
+    );
   }
 
   let sidebarHTML = "";
@@ -2344,10 +2483,14 @@ ${escapeHtml(email)}
     const displayName = getAccountDisplayName(acc);
     const provider = providerName(acc.provider);
 
-    const used = acc.storageQuota.usage;
-    const limit = acc.storageQuota.limit;
-    const driveUsed = acc.storageQuota.usageInDrive;
-    const trashUsed = acc.storageQuota.usageInDriveTrash;
+    // A card can arrive without a quota when the server could not read that one
+    // account. Read it defensively so one broken account cannot throw here and wipe
+    // out the whole rendered list.
+    const quota = acc.storageQuota || {};
+    const used = Number(quota.usage) || 0;
+    const limit = Number(quota.limit) || 0;
+    const driveUsed = Number(quota.usageInDrive) || 0;
+    const trashUsed = Number(quota.usageInDriveTrash) || 0;
 
     const percentRaw = limit > 0 ? (used / limit) * 100 : 0;
     const percent = Math.max(0, Math.min(100, percentRaw)).toFixed(1);
@@ -2371,6 +2514,20 @@ ${escapeHtml(email)}
       ? `<img src="${escapeHtml(photo)}" alt="${safeAlt}" referrerpolicy="no-referrer" onerror="this.style.display='none'; var fb=this.parentElement && this.parentElement.querySelector('.avatarFallback'); if(fb){fb.style.display='flex';}"><span class="avatarFallback" style="display:none;">${safeAvatar}</span>`
       : `<span class="avatarFallback">${safeAvatar}</span>`;
 
+    // An account the server could not read stays visible with the reason attached,
+    // instead of disappearing from the home screen without explanation.
+    const accountError = String(acc.error || "").trim();
+    const noticeHTML = accountError
+      ? `
+<div class="storageText" style="margin:8px 0 0;padding:8px 10px;border-radius:8px;background:rgba(200,60,45,.10);color:#a32b1f;">
+${escapeHtml(accountError)}${acc.needsReauth ? " Reconnect this account to fix it." : ""}
+</div>
+`
+      : "";
+    const actionHTML = acc.needsReauth
+      ? `<button type="button" class="browseBtn" onclick='connectDrive()'>Reconnect</button>`
+      : `<button type="button" class="browseBtn" onclick='browseAccount(${JSON.stringify(email)}, ${JSON.stringify(acc.provider || "google")})'>Browse</button>`;
+
     cardsHTML += `
 <div class="card">
 
@@ -2381,13 +2538,13 @@ ${escapeHtml(email)}
 <div class="avatar">${avatarHTML}</div>
 
 <div>
-<div class="email">${email}</div>
-<div class="storageText" style="margin:4px 0 0;">${provider}</div>
+<div class="email">${escapeHtml(email)}</div>
+<div class="storageText" style="margin:4px 0 0;">${escapeHtml(provider)}</div>
 </div>
 
 </div>
 
-<button class="logoutBtn" 
+<button class="logoutBtn"
   onclick='openLogoutModal(${JSON.stringify(email)}, ${JSON.stringify(acc.provider || "google")})'>
   <span class="logoutIcon">logout</span>
 </button>
@@ -2420,8 +2577,8 @@ ${usedFormatted} / ${limitFormatted} (${percent}% Used)
 </div>
 
 </div>
-
-<button type="button" class="browseBtn" onclick='browseAccount(${JSON.stringify(email)}, ${JSON.stringify(acc.provider || "google")})'>Browse</button>
+${noticeHTML}
+${actionHTML}
 
 </div>
 `;
@@ -2445,12 +2602,20 @@ ${usedFormatted} / ${limitFormatted} (${percent}% Used)
   try {
     setGreetingFromSavedName();
   } catch (e) { }
-  syncBrowserAccountsCacheFromServer();
+  // Only refresh the safety-net copy from a response we actually trust. Writing it
+  // after a failed load would overwrite the good cached list with an empty one.
+  if (!loadFailed) {
+    syncBrowserAccountsCacheFromServer();
+  }
 }
 
 initFirstVisitNamePrompt();
+consumeConnectMessagesFromUrl();
 restoreSessionFromBrowserCache().finally(loadStorage);
-window.addEventListener("pageshow", function () {
+window.addEventListener("pageshow", function (ev) {
+  // Skip the very first pageshow: the line above already ran this. Only a real
+  // back/forward restore needs to re-check.
+  if (!ev || !ev.persisted) return;
   restoreSessionFromBrowserCache().finally(loadStorage);
 });
 

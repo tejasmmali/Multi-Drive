@@ -19,3 +19,6 @@ Thumbs.db
 
 .vscode/
 .idea/
+.vercel
+VERCEL_FIX_NOTES.md
+.claude/
