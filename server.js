@@ -685,7 +685,23 @@ function logError(err) {
 function sendErrorJson(res, err, fallbackMessage) {
   logError(err)
   const status = err.response?.status || 500
-  const message = err.response?.data?.error?.message || fallbackMessage
+  const googleError = err.response?.data?.error
+
+  //give the short actionable version of the known Google failures (Drive API disabled,
+  //rate limit, dead token) here too, so browsing and uploading report the same fix as
+  //the account card instead of Google's 300 character paragraph.
+  if (googleError) {
+    const classified = classifyGoogleApiError(err)
+    if (classified.kind !== "other") {
+      return res.status(status).json({
+        error: classified.message + (classified.helpUrl ? " " + classified.helpUrl : ""),
+        needsReauth: classified.needsReauth,
+        helpUrl: classified.helpUrl
+      })
+    }
+  }
+
+  const message = googleError?.message || fallbackMessage
   res.status(status).json({ error: message })
 }
 
@@ -1203,8 +1219,22 @@ app.get("/auth/google/callback", async (req, res) => {
     //never reach Redis and the home page would come back with zero accounts.
     await req.saveUserSession()
 
-    console.log("Google account connected:", normalizeEmail(profileResponse.data.email))
-    res.redirect("/?connected=google")
+    //the account is connected either way, but a quick probe here means a project with
+    //the Drive API switched off is reported at connect time - with the fix - instead of
+    //turning into a broken card on the home screen.
+    let warning = ""
+    try {
+      await axios.get(DRIVE_ABOUT_URL, { headers: authHeaders(accessToken), timeout: 5000 })
+    } catch (probeErr) {
+      const classified = classifyGoogleApiError(probeErr)
+      if (classified.kind === "service_disabled") {
+        warning = "Account connected, but " + classified.message.charAt(0).toLowerCase() + classified.message.slice(1)
+        if (classified.helpUrl) warning += " " + classified.helpUrl
+      }
+    }
+
+    console.log("Google account connected:", normalizeEmail(profileResponse.data.email), warning ? "(drive api disabled)" : "")
+    res.redirect(warning ? "/?connectError=" + encodeURIComponent(warning) : "/?connected=google")
   } catch (err) {
     logError(err)
     const detail = err.response?.data?.error_description || err.response?.data?.error || err.message || "unknown error"
@@ -1249,6 +1279,141 @@ async function buildMegaStorageCard(account) {
   }
 }
 
+//megajs surfaces MEGA's numeric API errors as strings like
+//"ESID (-15): Invalid or expired user session, please relogin". Same idea as the Google
+//classifier: only some of them are fixed by reconnecting.
+function classifyMegaError(err) {
+  const raw = String(err?.message || "").trim()
+
+  const is = (code) => new RegExp("\\b" + code + "\\b", "i").test(raw)
+
+  if (is("ESID") || /session expired|please relogin|reconnect the account/i.test(raw)) {
+    return { needsReauth: true, message: "This MEGA session expired. Reconnect the account." }
+  }
+  if (is("EMFAREQUIRED")) {
+    return { needsReauth: true, message: "MEGA wants your two-factor code. Reconnect the account and enter it." }
+  }
+  if (is("ENOENT")) {
+    return { needsReauth: true, message: "MEGA rejected these credentials. Reconnect the account." }
+  }
+  if (is("EBLOCKED")) {
+    return { needsReauth: false, message: "MEGA has blocked this account." }
+  }
+  if (is("EOVERQUOTA") || is("EGOINGOVERQUOTA") || is("ESHAREROVERQUOTA")) {
+    return { needsReauth: false, message: "This MEGA account is over its quota." }
+  }
+  if (is("EAGAIN") || is("ERATELIMIT") || is("ETEMPUNAVAIL") || is("ETOOMANYCONNECTIONS")) {
+    return { needsReauth: false, message: "MEGA is busy right now. Retry in a moment." }
+  }
+
+  return { needsReauth: false, message: raw || "Unable to read this MEGA account right now." }
+}
+
+//Google answers 403 for several unrelated situations and only one of them is fixed by
+//reconnecting. Telling a user to reconnect when the Drive API is switched off in their
+//Cloud project sends them round a loop that can never succeed, so classify first.
+function classifyGoogleApiError(err) {
+  const status = Number(err?.response?.status || 0)
+  const payload = err?.response?.data?.error
+  const rawMessage = String(payload?.message || err?.message || "").trim()
+  const reasons = []
+  if (Array.isArray(payload?.errors)) {
+    payload.errors.forEach((item) => reasons.push(String(item?.reason || "").toLowerCase()))
+  }
+  if (Array.isArray(payload?.details)) {
+    payload.details.forEach((item) => reasons.push(String(item?.reason || "").toLowerCase()))
+  }
+  reasons.push(String(payload?.status || "").toLowerCase())
+
+  const has = (needle) => reasons.some((reason) => reason === needle)
+
+  //the "Help" detail carries the exact console URL for this project
+  let helpUrl = ""
+  if (Array.isArray(payload?.details)) {
+    for (const item of payload.details) {
+      const link = Array.isArray(item?.links) ? item.links.find((l) => l && l.url) : null
+      if (link) {
+        helpUrl = String(link.url)
+        break
+      }
+    }
+  }
+  if (!helpUrl) {
+    const found = rawMessage.match(/https:\/\/console\.(?:developers|cloud)\.google\.com\/\S+/)
+    if (found) helpUrl = found[0].replace(/[.,)]+$/, "")
+  }
+
+  //project number, so the message can say which project to go and fix
+  let project = ""
+  if (Array.isArray(payload?.details)) {
+    for (const item of payload.details) {
+      const consumer = String(item?.metadata?.consumer || "")
+      const match = consumer.match(/projects?\/(\d+)/)
+      if (match) {
+        project = match[1]
+        break
+      }
+    }
+  }
+  if (!project) {
+    const match = rawMessage.match(/project\s+(\d{6,})/i)
+    if (match) project = match[1]
+  }
+
+  const serviceDisabled =
+    has("accessnotconfigured") ||
+    has("service_disabled") ||
+    /has not been used in project|is disabled|api is not enabled/i.test(rawMessage)
+
+  if (status === 403 && serviceDisabled) {
+    if (!helpUrl) {
+      helpUrl = "https://console.cloud.google.com/apis/library/drive.googleapis.com" +
+        (project ? `?project=${project}` : "")
+    }
+    return {
+      kind: "service_disabled",
+      needsReauth: false,
+      helpUrl,
+      message:
+        "The Google Drive API is turned off in the Google Cloud project" +
+        (project ? ` ${project}` : "") +
+        " that these OAuth credentials belong to. Enable \"Google Drive API\" for that project, wait a minute for it to take effect, then reload this page."
+    }
+  }
+
+  if (has("ratelimitexceeded") || has("userratelimitexceeded") || has("quotaexceeded") || status === 429) {
+    return {
+      kind: "rate_limited",
+      needsReauth: false,
+      helpUrl: "",
+      message: "Google is rate limiting this account right now. Wait a moment and reload."
+    }
+  }
+
+  const scopeProblem =
+    has("insufficientpermissions") ||
+    has("access_token_scope_insufficient") ||
+    /insufficient (authentication )?scopes?/i.test(rawMessage)
+
+  if (status === 401 || (status === 403 && scopeProblem) || /invalid_grant|invalid credentials|token has been expired or revoked/i.test(rawMessage)) {
+    return {
+      kind: "auth",
+      needsReauth: true,
+      helpUrl: "",
+      message: scopeProblem
+        ? "This account did not grant Drive access. Reconnect it and allow the Drive permission."
+        : "Access to this account expired. Reconnect it to continue."
+    }
+  }
+
+  return {
+    kind: "other",
+    needsReauth: false,
+    helpUrl,
+    message: rawMessage || "Unable to read this account right now."
+  }
+}
+
 async function buildGoogleStorageCard(account) {
   let sessionChanged = false
 
@@ -1261,9 +1426,11 @@ async function buildGoogleStorageCard(account) {
   try {
     responses = await load()
   } catch (err) {
-    //401/403 means the access token died. try exactly one refresh before giving up.
-    const status = err.response?.status
-    const canRetry = (status === 401 || status === 403) && !!account.refreshToken
+    //only retry when the token itself is the problem. a 403 for a disabled Drive API or
+    //a rate limit is not fixed by minting a new token, and retrying just burns time
+    //against the function's deadline.
+    const classified = classifyGoogleApiError(err)
+    const canRetry = classified.needsReauth && !!account.refreshToken
     if (!canRetry) throw err
     if (!(await refreshGoogleAccount(account))) throw err
     sessionChanged = true
@@ -1295,16 +1462,31 @@ async function buildGoogleStorageCard(account) {
 function buildFailedStorageCard(account, err) {
   const provider = normalizeProvider(account.provider) || "google"
   const email = normalizeEmail(account.email)
-  const status = err?.response?.status || 0
-  const needsReauth = status === 401 || status === 403 || /session expired|invalid_grant|reconnect/i.test(String(err?.message || ""))
   const givenName = getFirstNameFromEmail(email)
+
+  let message = ""
+  let needsReauth = false
+  let helpUrl = ""
+
+  if (err?.isTimeout) {
+    message = "This account took too long to answer. Reload to try again."
+  } else if (provider === "mega") {
+    const classified = classifyMegaError(err)
+    message = classified.message
+    needsReauth = classified.needsReauth
+  } else {
+    const classified = classifyGoogleApiError(err)
+    message = classified.message
+    needsReauth = classified.needsReauth
+    helpUrl = classified.helpUrl
+  }
 
   return {
     provider,
-    error: err?.isTimeout
-      ? "This account took too long to answer. Reload to try again."
-      : (err?.response?.data?.error?.message || err?.message || "Unable to read this account right now."),
+    error: message,
     needsReauth,
+    //a link the user can act on (for example the "enable the Drive API" console page)
+    helpUrl,
     user: {
       emailAddress: email,
       displayName: givenName || (provider === "mega" ? "MEGA" : "Google Drive"),

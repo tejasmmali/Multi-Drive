@@ -6,6 +6,25 @@ const GOOGLE_CLIENT_ID_STORAGE_KEY = "multidrive-google-client-id";
 const GOOGLE_CLIENT_SECRET_STORAGE_KEY = "multidrive-google-client-secret";
 const BROWSER_ACCOUNTS_CACHE_KEY = "multidrive-browser-accounts-v1";
 
+// Provider logos are inlined on purpose. They used to be loaded from dl.svgcdn.com,
+// which no longer resolves, so the sidebar rendered a broken image glyph next to
+// "GOOGLE DRIVE". Inline SVG cannot break, needs no network round trip, and works
+// behind a proxy or offline.
+const GOOGLE_DRIVE_ICON_SVG =
+  '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 87.3 78" role="img" aria-label="Google Drive" focusable="false">' +
+  '<path d="M6.6 66.85l3.85 6.65c.8 1.4 1.95 2.5 3.3 3.3l13.75-23.8H0c0 1.55.4 3.1 1.2 4.5z" fill="#0066da"/>' +
+  '<path d="M43.65 25L29.9 1.2c-1.35.8-2.5 1.9-3.3 3.3l-25.4 44C.4 49.9 0 51.45 0 53h27.5z" fill="#00ac47"/>' +
+  '<path d="M73.55 76.8c1.35-.8 2.5-1.9 3.3-3.3l1.6-2.75 7.65-13.25c.8-1.4 1.2-2.95 1.2-4.5H59.8l5.85 11.5z" fill="#ea4335"/>' +
+  '<path d="M43.65 25L57.4 1.2C56.05.4 54.5 0 52.9 0H34.4c-1.6 0-3.15.45-4.5 1.2z" fill="#00832d"/>' +
+  '<path d="M59.8 53H27.5L13.75 76.8c1.35.8 2.9 1.2 4.5 1.2h50.8c1.6 0 3.15-.45 4.5-1.2z" fill="#2684fc"/>' +
+  '<path d="M73.4 26.5l-12.7-22c-.8-1.4-1.95-2.5-3.3-3.3L43.65 25l16.15 28h27.45c0-1.55-.4-3.1-1.2-4.5z" fill="#ffba00"/>' +
+  "</svg>";
+const MEGA_ICON_SVG =
+  '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" role="img" aria-label="MEGA" focusable="false">' +
+  '<circle cx="12" cy="12" r="12" fill="#d9272e"/>' +
+  '<path d="M4.9 7.3h2.5L12 11.9l4.6-4.6h2.5v9.4h-2.2v-6l-4.9 4.9-4.9-4.9v6H4.9z" fill="#fff"/>' +
+  "</svg>";
+
 function getSearchHistory() {
   try {
     const raw = localStorage.getItem(SEARCH_HISTORY_STORAGE_KEY);
@@ -126,12 +145,32 @@ function showConnectNotice(message, isError) {
   bar.style.background = isError ? "#fdecea" : "#e8f4ea";
   bar.style.color = isError ? "#8a1c14" : "#14532d";
   bar.style.border = "1px solid " + (isError ? "#f3b7b1" : "#a8d5b5");
-  bar.firstChild.textContent = text;
+
+  // A message can end with a URL the user has to open (for example the Google Cloud
+  // console page for enabling the Drive API), so make that part clickable.
+  const holder = bar.firstChild;
+  holder.textContent = "";
+  const urlMatch = text.match(/https?:\/\/\S+$/);
+  if (urlMatch) {
+    holder.appendChild(
+      document.createTextNode(text.slice(0, urlMatch.index).trim() + " "),
+    );
+    const link = document.createElement("a");
+    link.href = urlMatch[0];
+    link.target = "_blank";
+    link.rel = "noopener noreferrer";
+    link.textContent = "Open Google Cloud console";
+    link.style.color = "inherit";
+    link.style.fontWeight = "700";
+    holder.appendChild(link);
+  } else {
+    holder.textContent = text;
+  }
 
   window.clearTimeout(showConnectNotice._timer);
   showConnectNotice._timer = window.setTimeout(() => {
     if (bar && bar.parentNode) bar.remove();
-  }, isError ? 15000 : 6000);
+  }, isError ? 30000 : 6000);
 }
 
 // Messages the server hands back on a redirect (Google/MEGA connect results).
@@ -2447,18 +2486,10 @@ async function loadStorage() {
     const normalizedTitle = String(title || "")
       .trim()
       .toLowerCase();
-    const iconUrl =
-      normalizedTitle === "mega"
-        ? "https://dl.svgcdn.com/svg/simple-icons/mega.svg"
-        : "https://dl.svgcdn.com/svg/entypo-social/google-drive.svg";
-    const iconAlt =
-      normalizedTitle === "mega" ? "MEGA logo" : "Google Drive logo";
     const iconHtml =
-      '<span class="accountSectionIcon" aria-hidden="true"><img src="' +
-      iconUrl +
-      '" alt="' +
-      iconAlt +
-      '" loading="lazy" decoding="async"></span>';
+      '<span class="accountSectionIcon" aria-hidden="true">' +
+      (normalizedTitle === "mega" ? MEGA_ICON_SVG : GOOGLE_DRIVE_ICON_SVG) +
+      "</span>";
     sidebarHTML +=
       '<div class="accountSectionTitle">' +
       iconHtml +
@@ -2516,17 +2547,30 @@ ${escapeHtml(email)}
 
     // An account the server could not read stays visible with the reason attached,
     // instead of disappearing from the home screen without explanation.
+    // "Reconnect" is only offered when reconnecting can actually fix it - a disabled
+    // Drive API or a rate limit needs a different action, and sending the user round
+    // the OAuth loop for those would never work.
     const accountError = String(acc.error || "").trim();
+    const helpUrl = String(acc.helpUrl || "").trim();
+    const safeHelpUrl = /^https:\/\//i.test(helpUrl) ? helpUrl : "";
+    const helpLinkHTML = safeHelpUrl
+      ? ` <a href="${escapeHtml(safeHelpUrl)}" target="_blank" rel="noopener noreferrer" style="color:inherit;font-weight:700;">Open Google Cloud console</a>`
+      : "";
     const noticeHTML = accountError
       ? `
 <div class="storageText" style="margin:8px 0 0;padding:8px 10px;border-radius:8px;background:rgba(200,60,45,.10);color:#a32b1f;">
-${escapeHtml(accountError)}${acc.needsReauth ? " Reconnect this account to fix it." : ""}
+${escapeHtml(accountError)}${helpLinkHTML}
 </div>
 `
       : "";
+    // needsReauth  -> reconnecting is the fix
+    // error only    -> the fix is elsewhere (enable the API, wait out a rate limit), so
+    //                  offer a retry rather than a Browse that is bound to fail
     const actionHTML = acc.needsReauth
       ? `<button type="button" class="browseBtn" onclick='connectDrive()'>Reconnect</button>`
-      : `<button type="button" class="browseBtn" onclick='browseAccount(${JSON.stringify(email)}, ${JSON.stringify(acc.provider || "google")})'>Browse</button>`;
+      : accountError
+        ? `<button type="button" class="browseBtn" onclick='loadStorage()'>Retry</button>`
+        : `<button type="button" class="browseBtn" onclick='browseAccount(${JSON.stringify(email)}, ${JSON.stringify(acc.provider || "google")})'>Browse</button>`;
 
     cardsHTML += `
 <div class="card">
