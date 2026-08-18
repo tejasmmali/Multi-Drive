@@ -9,9 +9,12 @@ const crypto = require("crypto")
 require("dotenv").config()
 
 const app = express()
+//multer buffers in memory, so this cap is about this process's RAM. Only MEGA uploads
+//come through here now, and only ones under the client's 50 MB streaming threshold.
+const MULTER_MAX_BYTES = 100 * 1024 * 1024
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 100 * 1024 * 1024 }
+  limits: { fileSize: MULTER_MAX_BYTES }
 })
 
 app.use(cors())
@@ -62,6 +65,7 @@ const GOOGLE_API_PATHS = new Set([
   "/copy-item",
   "/move-item",
   "/create-folder",
+  "/upload-session",
   "/upload-item",
   "/upload-item-stream"
 ])
@@ -78,6 +82,7 @@ app.use(async (req, res, next) => {
 
 app.use((req, res, next) => {
   if (req.path === "/upload-item-stream" || req.path === "/upload-item") {
+    //an upload that goes through this process is not bound by the API timeouts.
     req.setTimeout(2 * 60 * 60 * 1000)
     res.setTimeout(2 * 60 * 60 * 1000)
   }
@@ -135,6 +140,13 @@ const SESSION_KEY_PREFIX = "multidrive:sess:"
 //the OAuth redirect lands on a different lambda instance.
 const IS_SERVERLESS = !!(process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME || process.env.NOW_REGION)
 const STORAGE_ACCOUNT_TIMEOUT_MS = Number(process.env.STORAGE_ACCOUNT_TIMEOUT_MS || 7000)
+//Vercel buffers the entire request body before the function starts and rejects anything
+//over ~4.5 MB with its own error page, so an upload proxied through this process can never
+//be larger than that on the hosted site. Google uploads dodge the limit entirely by going
+//browser -> Google; MEGA cannot, so the browser is told the cap up front and can say so.
+const PROXY_UPLOAD_MAX_BYTES = Number(
+  process.env.PROXY_UPLOAD_MAX_BYTES || (IS_SERVERLESS ? 4 * 1024 * 1024 : 10 * 1024 * 1024 * 1024)
+)
 //kept just under the 10s function limit of the Vercel hobby plan so the browser gets a
 //readable JSON error instead of the platform's HTML timeout page.
 const MEGA_LOGIN_TIMEOUT_MS = Number(process.env.MEGA_LOGIN_TIMEOUT_MS || (IS_SERVERLESS ? 9000 : 60000))
@@ -405,10 +417,18 @@ function setUploadProgress(id, patch) {
   next.etaSec = avgBps > 0 && total > uploaded ? Math.ceil((total - uploaded) / avgBps) : 0
 
   const finalState = { ...next }
-  uploadProgress.set(id, finalState)
   if (HAS_UPSTASH) {
-    redisSetJson(`multidrive:progress:${id}`, finalState, 5 * 60).catch(() => { })
+    //megajs emits a progress event per chunk, and mirroring every one of them would burn
+    //thousands of Upstash commands on a single upload. Only status changes and one write
+    //per second reach Redis; the browser polls every 300ms, so it loses nothing that
+    //matters and the daily command quota survives.
+    const changedPhase = prev.status !== finalState.status || prev.phase !== finalState.phase
+    if (changedPhase || now - Number(prev.redisWrittenAt || 0) >= 1000) {
+      finalState.redisWrittenAt = now
+      redisSetJson(`multidrive:progress:${id}`, finalState, 5 * 60).catch(() => { })
+    }
   }
+  uploadProgress.set(id, finalState)
 }
 
 function cleanupUploadProgress(id, delayMs = 5 * 60 * 1000) {
@@ -1996,10 +2016,76 @@ app.post("/create-folder", async (req, res) => {
 })
 
 
+//Uploading a file no longer means pushing it through this server.
+//The browser asks here for a Google resumable session URL, then PUTs the bytes straight to
+//Google. This request carries no file data, so it finishes in milliseconds and fits inside
+//any serverless request body limit - which is the only reason uploads work on Vercel at
+//all. It also means the browser's progress events finally measure the real transfer.
+app.post("/upload-session", async (req, res) => {
+  try {
+    const email = getBodyTrimmed(req, "email")
+    const provider = getBodyTrimmed(req, "provider")
+    const parentId = getBodyTrimmed(req, "parentId")
+    const name = getBodyTrimmed(req, "name") || "upload.bin"
+    const mimeType = getBodyTrimmed(req, "mimeType") || "application/octet-stream"
+    const size = Number(req.body?.size || 0) || 0
+
+    if (!email || !parentId) {
+      return res.status(400).json({ error: "email and parentId are required" })
+    }
+
+    const account = getAccountByEmail(req.userSession, email, provider)
+    if (!account) {
+      return res.status(404).json({ error: "Account not found. Reconnect it and try again." })
+    }
+
+    //MEGA has no equivalent handoff: its upload needs the account session and megajs's
+    //chunk encryption, so those bytes still travel through this server. Telling the browser
+    //the cap up front turns an over sized MEGA upload into a sentence it can show instead
+    //of the host's own error page.
+    if (normalizeProvider(account.provider) === "mega") {
+      return res.json({
+        mode: "server",
+        providerName: "MEGA",
+        maxBytes: PROXY_UPLOAD_MAX_BYTES
+      })
+    }
+
+    const startRes = await axios.post(
+      DRIVE_UPLOAD_URL,
+      { name, parents: [parentId] },
+      {
+        headers: {
+          ...authHeaders(account.token),
+          "Content-Type": "application/json; charset=UTF-8",
+          "X-Upload-Content-Type": mimeType,
+          ...(size > 0 ? { "X-Upload-Content-Length": String(size) } : {})
+        },
+        params: {
+          uploadType: "resumable",
+          supportsAllDrives: true,
+          fields: "id,name,mimeType,size,modifiedTime,webViewLink,parents,driveId"
+        }
+      }
+    )
+
+    const uploadUrl = startRes.headers && (startRes.headers.location || startRes.headers.Location)
+    if (!uploadUrl) {
+      return res.status(502).json({ error: "Google did not return an upload session URL" })
+    }
+
+    //the session URL is the credential for the PUT, so no access token reaches the browser.
+    res.json({ mode: "direct", uploadUrl, maxBytes: PROXY_UPLOAD_MAX_BYTES })
+  } catch (err) {
+    sendErrorJson(res, err, "Could not start the upload")
+  }
+})
+
+//MEGA only. Google Drive bytes never arrive here any more, see /upload-session.
 app.post("/upload-item-stream", async (req, res) => {
   const bb = busboy({
     headers: req.headers,
-    limits: { fileSize: 10 * 1024 * 1024 * 1024 }
+    limits: { fileSize: PROXY_UPLOAD_MAX_BYTES }
   })
 
   const fields = {}
@@ -2046,7 +2132,7 @@ app.post("/upload-item-stream", async (req, res) => {
       message: "Preparing upload"
     })
 
-    if (account.provider === "mega") {
+    if (normalizeProvider(account.provider) === "mega") {
       try {
         const storage = await ensureMegaStorageForAccount(account)
 
@@ -2114,74 +2200,15 @@ app.post("/upload-item-stream", async (req, res) => {
       }
     }
 
-    try {
-      const metadata = { name: fileName, parents: [parentId] }
-
-      const startRes = await axios.post(DRIVE_UPLOAD_URL, metadata, {
-        headers: {
-          ...authHeaders(account.token),
-          "Content-Type": "application/json; charset=UTF-8",
-          "X-Upload-Content-Type": fileMime,
-          ...(fileSize ? { "X-Upload-Content-Length": String(fileSize) } : {})
-        },
-        params: {
-          uploadType: "resumable",
-          supportsAllDrives: true,
-          fields: "id,name,mimeType,size,modifiedTime,webViewLink,parents,driveId"
-        }
-      })
-
-      const resumableUrl = startRes.headers.location || startRes.headers.Location
-      if (!resumableUrl) {
-        fileStream.resume()
-        return safeRespond(500, { error: "Could not start Google upload session" })
-      }
-
-      setUploadProgress(uploadId, {
-        status: "uploading",
-        phase: "google",
-        bytesUploaded: 0,
-        bytesTotal: fileSize,
-        message: "Streaming to Google Drive"
-      })
-
-      let bytesUploaded = 0
-      fileStream.on("data", (chunk) => {
-        bytesUploaded += chunk.length
-        setUploadProgress(uploadId, {
-          bytesUploaded,
-          bytesTotal: fileSize || bytesUploaded,
-          message: "Streaming to Google Drive"
-        })
-      })
-
-      const uploadRes = await axios.put(resumableUrl, fileStream, {
-        headers: {
-          "Content-Type": fileMime,
-          ...(fileSize
-            ? { "Content-Length": String(fileSize) }
-            : { "Transfer-Encoding": "chunked" })
-        },
-        maxBodyLength: Infinity,
-        maxContentLength: Infinity
-      })
-
-      const doneBytes = Math.max(bytesUploaded, fileSize, 0)
-      setUploadProgress(uploadId, {
-        status: "done",
-        phase: "done",
-        bytesUploaded: doneBytes,
-        bytesTotal: fileSize || doneBytes,
-        message: "Upload complete"
-      })
-      cleanupUploadProgress(uploadId)
-      return safeRespond(200, { success: true, item: uploadRes.data })
-    } catch (err) {
-      setUploadProgress(uploadId, { status: "error", phase: "error", message: err.message })
-      cleanupUploadProgress(uploadId, 60000)
-      logError(err)
-      return safeRespond(500, { error: err.message || "Google Drive upload failed" })
-    }
+    //Google Drive used to be streamed on to Google from here. It was also the worst place
+    //for it: the bytes crossed the network twice, the old progress counter measured the
+    //browser -> server hop rather than the server -> Google one, and on a serverless host
+    //the request body never even arrived. The browser PUTs to Google itself now, so
+    //anything non-MEGA reaching this route is a page loaded before the change.
+    fileStream.resume()
+    return safeRespond(400, {
+      error: "Google Drive uploads no longer go through the server. Reload the page and try again."
+    })
   })
 
   bb.on("error", (err) => {
@@ -2223,7 +2250,7 @@ app.post("/upload-item", upload.single("file"), async (req, res) => {
       return res.status(404).json({ error: "Account not found" })
     }
 
-    if (account.provider === "mega") {
+    if (normalizeProvider(account.provider) === "mega") {
       const storage = await ensureMegaStorageForAccount(account)
       const targetFolder = parentId === "root" ? storage.root : getMegaNodeById(storage, parentId)
       if (!targetFolder || !targetFolder.directory) {
@@ -2261,66 +2288,10 @@ app.post("/upload-item", upload.single("file"), async (req, res) => {
       return res.json({ success: true })
     }
 
-    const metadata = {
-      name: file.originalname || "upload.bin",
-      parents: [parentId]
-    }
-
-    // Google upload path: initiate resumable session, then stream media bytes to Drive.
-    // This avoids local disk storage and sends bytes directly to Google.
-    const startRes = await axios.post(DRIVE_UPLOAD_URL, metadata, {
-      headers: {
-        ...authHeaders(account.token),
-        "Content-Type": "application/json; charset=UTF-8",
-        "X-Upload-Content-Type": file.mimetype || "application/octet-stream",
-        "X-Upload-Content-Length": String(Number(file.size || 0))
-      },
-      params: {
-        uploadType: "resumable",
-        supportsAllDrives: true,
-        fields: "id,name,mimeType,size,modifiedTime,webViewLink,parents,driveId"
-      }
+    //Google Drive goes browser -> Google now, see /upload-session.
+    return res.status(400).json({
+      error: "Google Drive uploads no longer go through the server. Reload the page and try again."
     })
-    const resumableUrl = startRes.headers && (startRes.headers.location || startRes.headers.Location)
-    if (!resumableUrl) {
-      return res.status(500).json({ error: "Could not start Google upload session" })
-    }
-
-    setUploadProgress(uploadId, {
-      status: "uploading",
-      phase: "google",
-      bytesUploaded: 0,
-      bytesTotal: Number(file.size || 0),
-      message: "Uploading to Google Drive"
-    })
-
-    const response = await axios.put(resumableUrl, file.buffer, {
-      headers: {
-        "Content-Type": file.mimetype || "application/octet-stream",
-        "Content-Length": String(Number(file.size || 0))
-      },
-      onUploadProgress: (ev) => {
-        const loaded = Number(ev && ev.loaded ? ev.loaded : 0)
-        const total = Number(ev && ev.total ? ev.total : file.size || 0)
-        setUploadProgress(uploadId, {
-          status: "uploading",
-          phase: "google",
-          bytesUploaded: loaded,
-          bytesTotal: total,
-          message: "Uploading to Google Drive"
-        })
-      }
-    })
-
-    setUploadProgress(uploadId, {
-      status: "done",
-      phase: "done",
-      bytesUploaded: Number(file.size || 0),
-      bytesTotal: Number(file.size || 0),
-      message: "Upload complete"
-    })
-    cleanupUploadProgress(uploadId)
-    res.json({ success: true, item: response.data })
   } catch (err) {
     const uploadId = getBodyTrimmed(req, "uploadId")
     setUploadProgress(uploadId, {
@@ -2352,7 +2323,10 @@ app.get("/upload-progress", async (req, res) => {
 
 app.use((err, req, res, next) => {
   if (err && err.code === "LIMIT_FILE_SIZE") {
-    return res.status(413).json({ error: "File too large. Max upload size is 1 GB." })
+    return res.status(413).json({
+      error: "File too large for a server side upload. Max is " +
+        Math.round(MULTER_MAX_BYTES / (1024 * 1024)) + " MB."
+    })
   }
   if (err) {
     return res.status(500).json({ error: err.message || "Server error" })

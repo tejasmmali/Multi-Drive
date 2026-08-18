@@ -726,7 +726,6 @@ let homeDropFiles = [];
 let homeDragDepth = 0;
 let homeUploadInProgress = false;
 let homeUploadCancelRequested = false;
-let homeActiveUploadXhr = null;
 let homeActivePollTimer = null;
 
 let browseEmail = "";
@@ -1169,54 +1168,7 @@ function makeUploadId() {
   return "up_" + Date.now() + "_" + Math.random().toString(36).slice(2, 10);
 }
 
-function uploadFileWithProgress(form, onProgress, uploadId, fileSize, meta) {
-  return new Promise((resolve, reject) => {
-    const xhr = new XMLHttpRequest();
-    homeActiveUploadXhr = xhr;
-    const STREAM_THRESHOLD = 50 * 1024 * 1024;
-    const isLarge = Number(fileSize || 0) > STREAM_THRESHOLD;
-    const url = isLarge ? "/upload-item-stream" : "/upload-item";
-    xhr.open("POST", url, true);
-    if (isLarge) {
-      xhr.setRequestHeader("x-file-size", String(Number(fileSize || 0)));
-      if (meta && meta.email)
-        xhr.setRequestHeader("x-upload-email", String(meta.email));
-      if (meta && meta.provider)
-        xhr.setRequestHeader("x-upload-provider", String(meta.provider));
-      if (meta && meta.parentId)
-        xhr.setRequestHeader("x-upload-parent-id", String(meta.parentId));
-      if (uploadId) xhr.setRequestHeader("x-upload-id", String(uploadId));
-    }
-    xhr.upload.onprogress = function (ev) {
-      if (!ev || !ev.lengthComputable) return;
-      onProgress(ev.loaded, ev.total);
-    };
-    xhr.onload = function () {
-      if (homeActiveUploadXhr === xhr) homeActiveUploadXhr = null;
-      const raw = xhr.responseText || "";
-      let payload = {};
-      try {
-        payload = raw ? JSON.parse(raw) : {};
-      } catch (e) { }
-      if (xhr.status >= 200 && xhr.status < 300) {
-        resolve(payload);
-      } else {
-        reject(
-          new Error(payload && payload.error ? payload.error : "Upload failed"),
-        );
-      }
-    };
-    xhr.onerror = function () {
-      if (homeActiveUploadXhr === xhr) homeActiveUploadXhr = null;
-      reject(new Error("Upload failed. Please try again."));
-    };
-    xhr.onabort = function () {
-      if (homeActiveUploadXhr === xhr) homeActiveUploadXhr = null;
-      reject(new Error("Upload cancelled by user."));
-    };
-    xhr.send(form);
-  });
-}
+//the upload itself lives in js/upload.js, shared with the browse page.
 
 async function uploadDroppedFilesToAccount(accountKey) {
   const status = document.getElementById("homeUploadChoiceStatus");
@@ -1294,21 +1246,19 @@ async function uploadDroppedFilesToAccount(accountKey) {
           formatRate(smoothedSpeed) +
           " • ETA —",
       });
-      const form = new FormData();
-      form.append("email", email);
-      form.append("provider", provider);
-      form.append("parentId", "root");
-      form.append("file", file, file.name);
       const fileSize = Number(file && file.size) || 0;
       const uploadId = makeUploadId();
-      form.append("uploadId", uploadId);
       const isMegaProvider = normalizeProvider(provider) === "mega";
       let megaPhaseActive = true;
       let hasServerSample = false;
       let currentFileClientLoaded = 0;
       let lastServerRatio = 0;
       let pollTimer = null;
-      pollTimer = window.setInterval(async () => {
+      //only MEGA needs the server side progress feed: its bytes still pass through the
+      //server, so the browser's own progress events stop at that hop. A Google upload goes
+      //straight to Google, where xhr progress is already the real number.
+      if (isMegaProvider) {
+        pollTimer = window.setInterval(async () => {
         if (!megaPhaseActive) return;
         try {
           const pRes = await fetch(
@@ -1361,11 +1311,18 @@ async function uploadDroppedFilesToAccount(accountKey) {
               (smoothedSpeed > 0 ? formatDuration(etaSec) : "—"),
           });
         } catch (e) { }
-      }, 300);
+        }, 300);
+      }
       homeActivePollTimer = pollTimer;
 
-      await uploadFileWithProgress(
-        form,
+      await mdUploadFile(
+        file,
+        {
+          email: email,
+          provider: provider,
+          parentId: "root",
+          uploadId: uploadId,
+        },
         function (loaded) {
           currentFileClientLoaded = Math.min(
             fileSize,
@@ -1414,9 +1371,6 @@ async function uploadDroppedFilesToAccount(accountKey) {
               (smoothedSpeed > 0 ? formatDuration(etaSec) : "—"),
           });
         },
-        uploadId,
-        fileSize,
-        { email, provider, parentId: "root" },
       );
       megaPhaseActive = false;
       if (pollTimer) {
@@ -1479,7 +1433,6 @@ async function uploadDroppedFilesToAccount(accountKey) {
       clearInterval(homeActivePollTimer);
       homeActivePollTimer = null;
     }
-    homeActiveUploadXhr = null;
     homeUploadInProgress = false;
   }
 }
@@ -2770,9 +2723,7 @@ document
       clearInterval(homeActivePollTimer);
       homeActivePollTimer = null;
     }
-    if (homeActiveUploadXhr) {
-      homeActiveUploadXhr.abort();
-    }
+    mdAbortUpload();
     setUploadCancelConfirmVisible(false);
   });
 document

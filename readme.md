@@ -28,9 +28,11 @@ Manage multiple Google Drive and Mega accounts from a single interface with opti
 - Browse, upload, copy/move, create folders, and search across accounts
 - Storage usage is shown per connected account
 - MEGA delete is currently disabled (Google Drive delete works)
+- Google Drive uploads have no size limit on the hosted site (the file goes straight from
+  your browser to Google). **MEGA uploads on the hosted site are limited to about 4 MB** -
+  use localhost for larger MEGA files
 - If an account card shows "Reconnect", that account's access expired - connect it again
-- Deploying it yourself? Read `VERCEL_FIX_NOTES.md` first, it lists the required
-  environment variables and how to verify a deployment
+
 
 
 
