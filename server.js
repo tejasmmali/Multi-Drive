@@ -2059,6 +2059,11 @@ app.post("/upload-session", async (req, res) => {
           ...authHeaders(account.token),
           "Content-Type": "application/json; charset=UTF-8",
           "X-Upload-Content-Type": mimeType,
+          //Google decides whether the session URL will answer CORS from the Origin on THIS
+          //request, not on the browser's PUT. Without it the browser uploads every byte and
+          //then cannot read the reply - which looks exactly like a failed upload of a file
+          //that is now sitting in Drive.
+          ...(req.headers.origin ? { Origin: req.headers.origin } : {}),
           ...(size > 0 ? { "X-Upload-Content-Length": String(size) } : {})
         },
         params: {
@@ -2078,6 +2083,40 @@ app.post("/upload-session", async (req, res) => {
     res.json({ mode: "direct", uploadUrl, maxBytes: PROXY_UPLOAD_MAX_BYTES })
   } catch (err) {
     sendErrorJson(res, err, "Could not start the upload")
+  }
+})
+
+//Did the upload actually land? A browser PUT that ends with status 0 says nothing about what
+//Google received - the bytes may all have arrived and only the reply got lost. Google is the
+//only one who knows, and a resumable session answers that question directly: an empty PUT
+//with "Content-Range: bytes star/size" returns 200/201 with the file when it is complete, or
+//308 when it is not. Without this, a lost reply is reported as a failure for a file the user
+//can already see in Drive.
+app.post("/upload-session-status", async (req, res) => {
+  try {
+    const uploadUrl = getBodyTrimmed(req, "uploadUrl")
+    const size = Number(req.body?.size || 0) || 0
+
+    //the browser hands us a URL and we fetch it, so pin it to Google's upload host.
+    if (!uploadUrl.startsWith("https://www.googleapis.com/upload/drive/v3/files")) {
+      return res.status(400).json({ error: "Not a Google upload session URL" })
+    }
+
+    const statusRes = await axios.put(uploadUrl, null, {
+      headers: {
+        "Content-Range": size > 0 ? `bytes */${size}` : "bytes */*",
+        "Content-Length": 0
+      },
+      maxRedirects: 0, //308 here means "not finished", not "go somewhere else"
+      validateStatus: () => true
+    })
+
+    if (statusRes.status === 200 || statusRes.status === 201) {
+      return res.json({ complete: true, file: statusRes.data || {} })
+    }
+    res.json({ complete: false, status: statusRes.status })
+  } catch (err) {
+    sendErrorJson(res, err, "Could not check the upload")
   }
 })
 

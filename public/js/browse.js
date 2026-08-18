@@ -1379,11 +1379,8 @@ async function uploadDroppedFiles(fileList) {
         String(err.message || "")
           .toLowerCase()
           .includes("cancel"));
-    if (!isCancelled) {
-      alert(
-        err && err.message ? err.message : "Upload failed. Please try again.",
-      );
-    }
+    //no alert(): the status card below says the same thing without blocking the page, and
+    //the folder refresh right after it used to look like the site reloading itself.
     updateUploadStatusCard({
       title: isCancelled ? "Upload cancelled" : "Upload failed",
       account: providerName(browseProvider) + " - " + browseEmail,

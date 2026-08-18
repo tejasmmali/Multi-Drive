@@ -14,6 +14,7 @@ global.FormData = class {
 }
 
 const calls = []
+let putFailsWithStatusZero = false
 
 class FakeXHR {
   constructor() {
@@ -29,6 +30,10 @@ class FakeXHR {
     if (this.upload.onprogress) {
       this.upload.onprogress({ lengthComputable: true, loaded: 7, total: 9 })
     }
+    if (putFailsWithStatusZero && this.method === "PUT") {
+      this.status = 0
+      return setTimeout(() => this.onerror(), 0)
+    }
     setTimeout(() => this.onload(), 0)
   }
   abort() { }
@@ -36,9 +41,11 @@ class FakeXHR {
 global.XMLHttpRequest = FakeXHR
 
 let sessionReply = null
+let statusReply = { complete: false }
 global.fetch = async (url, options) => {
   calls.push({ method: "POST", url, body: JSON.parse(options.body) })
-  return { ok: true, status: 200, json: async () => sessionReply }
+  const reply = url === "/upload-session-status" ? statusReply : sessionReply
+  return { ok: true, status: 200, json: async () => reply }
 }
 
 eval(fs.readFileSync(path.join(__dirname, "public", "js", "upload.js"), "utf8"))
@@ -87,6 +94,33 @@ async function main() {
   await window.mdUploadFile(file(big), meta("mega"), () => { })
   assert.strictEqual(calls[1].url, "/upload-item-stream")
   assert.strictEqual(calls[1].headers["x-file-size"], String(big))
+
+  //5. A Google PUT whose reply is lost (status 0) but whose bytes landed must be reported as
+  //   a success, not as "upload failed" for a file that is already in Drive.
+  sessionReply = {
+    mode: "direct",
+    uploadUrl: "https://www.googleapis.com/upload/drive/v3/files?upload_id=abc",
+    maxBytes: 4 * 1024 * 1024
+  }
+  statusReply = { complete: true, file: { id: "f1", name: "clip.mp4" } }
+  putFailsWithStatusZero = true
+  calls.length = 0
+  let finalProgress = 0
+  const saved = await window.mdUploadFile(file(66 * 1024 * 1024), meta("google"), (loaded) => {
+    finalProgress = loaded
+  })
+  assert.strictEqual(saved.id, "f1", "a completed session must resolve as a success")
+  assert.strictEqual(calls[2].url, "/upload-session-status")
+  assert.strictEqual(finalProgress, 66 * 1024 * 1024, "the card must end at 100%")
+
+  //6. Same lost reply, but Google says the session never completed: that is a real failure.
+  statusReply = { complete: false, status: 308 }
+  calls.length = 0
+  await assert.rejects(
+    () => window.mdUploadFile(file(66 * 1024 * 1024), meta("google"), () => { }),
+    /connection failed/i
+  )
+  putFailsWithStatusZero = false
 
   console.log("upload routing OK")
 }

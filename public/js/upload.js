@@ -87,6 +87,27 @@
     return sendXhr(xhr, file, onProgress);
   }
 
+  //status 0 means the browser never read a reply, not that the upload failed. Google may
+  //well have the whole file. Ask the server to query the session before calling it a
+  //failure, otherwise a lost reply is reported as a failed upload of a file that is already
+  //in Drive.
+  async function fetchLandedFile(uploadUrl, file) {
+    try {
+      var res = await fetch("/upload-session-status", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "same-origin",
+        cache: "no-store",
+        body: JSON.stringify({ uploadUrl: uploadUrl, size: Number(file.size) || 0 })
+      });
+      var payload = await res.json();
+      if (!res.ok || !payload || !payload.complete) return null;
+      return payload.file || {};
+    } catch (e) {
+      return null;
+    }
+  }
+
   function uploadToServer(file, meta, onProgress) {
     var size = Number(file.size) || 0;
     var form = new FormData();
@@ -126,9 +147,17 @@
       try {
         return await uploadToGoogle(session.uploadUrl, file, onProgress);
       } catch (err) {
-        
-        if (err && err.status === 0 && size > 0 && size <= proxyMax) {
-          return uploadToServer(file, meta, onProgress);
+        if (err && err.status === 0) {
+          var landed = await fetchLandedFile(session.uploadUrl, file);
+          if (landed) {
+            if (onProgress) onProgress(size, size);
+            return landed;
+          }
+          //ponytail: last resort for a blocked cross origin PUT - retry through the server
+          //while it still fits. drop once direct uploads are proven in production.
+          if (size > 0 && size <= proxyMax) {
+            return uploadToServer(file, meta, onProgress);
+          }
         }
         throw err;
       }
