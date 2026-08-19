@@ -9,12 +9,23 @@
   --font-display: "Sora", "Manrope", "Segoe UI", Roboto, Arial, sans-serif;
 }
 
+/* Vercel style dark: pure black page, near black surfaces, neutral grays, no blue tint.
+   Same tokens as index.css - keep the two blocks identical or the pages drift apart. */
 body.darkMode {
-  --bg: #0a111f;
-  --card: #121a2b;
-  --text: #eef4ff;
-  --muted: #a8b5cc;
-  --border: #3a4c68;
+  --bg: #000000;
+  --card: #0a0a0a;
+  --text: #ededed;
+  --muted: #8f8f8f;
+  /* White structure, 32% white for controls and menus, 14% white for separators -
+     the dark mirror of light mode's ink / part ink / hairline tiers. */
+  --border: #ffffff;
+  --borderSoft: rgba(255, 255, 255, 0.32);
+  --line: rgba(255, 255, 255, 0.14);
+  --field: #111111;
+  --hover: #1a1a1a;
+  --link: #3291ff;
+  --danger: #e5484d;
+  --dangerHover: #ff6166;
 }
 
 * {
@@ -181,9 +192,9 @@ button {
 }
 
 body.darkMode .backBtn {
-  border-color: #3a4c68;
-  background: #0f172a;
-  color: #ffffff;
+  border-color: var(--border);
+  background: var(--field);
+  color: var(--text);
 }
 
 .backBtn:hover {
@@ -191,12 +202,16 @@ body.darkMode .backBtn {
   border: #161616dc;
 }
 
+body.darkMode .backBtn:hover {
+  background: var(--hover);
+}
+
 .backBtn:active {
   background: #000000;
 }
 
 body.darkMode .backBtn:active {
-  background: #0b1220;
+  background: var(--hover);
 }
 
 @media (max-width: 640px) {
@@ -226,9 +241,9 @@ body.darkMode .backBtn:active {
 }
 
 body.darkMode .newFolderBtn {
-  border-color: rgba(203, 213, 225, 0.45);
-  background: rgba(16, 25, 43, 0.45);
-  color: #e5e7eb;
+  border-color: var(--borderSoft);
+  background: var(--field);
+  color: var(--text);
 }
 
 .newFolderBtn:hover {
@@ -237,10 +252,6 @@ body.darkMode .newFolderBtn {
 
 .newFolderBtn:active {
   box-shadow: inset 0 2px 4px rgba(17, 17, 17, 0.26);
-}
-
-body.darkMode .newFolderBtn:active {
-  box-shadow: inset 0 2px 4px rgba(2, 8, 23, 0.55);
 }
 
 .panel {
@@ -254,11 +265,6 @@ body.darkMode .newFolderBtn:active {
   flex-direction: column;
 }
 
-body.darkMode .panel {
-  border-color: #3a4c68;
-  background: var(--card);
-}
-
 .browseNav {
   display: flex;
   flex-wrap: wrap;
@@ -270,8 +276,7 @@ body.darkMode .panel {
 }
 
 body.darkMode .browseNav {
-  border-bottom-color: #2d3f5f;
-  background: var(--card);
+  border-bottom-color: var(--line);
 }
 
 .browseNavBtn {
@@ -285,7 +290,7 @@ body.darkMode .browseNav {
 }
 
 body.darkMode .browseNavBtn {
-  border-color: #4a5f84;
+  border-color: var(--borderSoft);
   background: var(--card);
   color: var(--text);
 }
@@ -301,7 +306,7 @@ body.darkMode .browseNavBtn {
 }
 
 body.darkMode .browseNavBtn.active {
-  background: rgba(79, 102, 145, 0.32);
+  background: var(--hover);
 }
 
 .browseBreadcrumb {
@@ -334,7 +339,7 @@ body.darkMode .browseNavBtn.active {
   left: 10px;
   top: 50%;
   transform: translateY(-50%);
-  color: #64748b;
+  color: var(--muted);
   pointer-events: none;
   font-family: "Material Symbols Rounded";
   font-weight: normal;
@@ -525,34 +530,34 @@ body.darkMode .browseNavBtn.active {
 
 body.darkMode .browseSearchInput,
 body.darkMode .browseSearchClearBtn {
-  background: #10182a;
+  background: var(--field);
 }
 
 body.darkMode .browseSearchLeadIcon {
-  color: #e2e8f0;
+  color: var(--muted);
 }
 
 body.darkMode .browseSearchInput::placeholder {
-  color: #8fa1bf;
+  color: var(--muted);
 }
 
 body.darkMode .browseSearchClearBtn {
-  border-color: #4e6287;
-  color: #9fb2d3;
+  border-color: var(--borderSoft);
+  color: var(--muted);
 }
 
 body.darkMode .browseSuggest {
-  background: rgba(16, 24, 42, 0.58);
-  border-color: #4a5f84;
+  background: var(--card);
+  border-color: var(--border);
   box-shadow: none;
 }
 
 body.darkMode .browseSuggestItem {
-  border-bottom-color: #2a3a55;
+  border-bottom-color: var(--line);
 }
 
 body.darkMode .browseSuggestItem:hover {
-  background: rgba(56, 78, 118, 0.32);
+  background: var(--hover);
 }
 
 .bcSep {
@@ -633,7 +638,7 @@ body.darkMode .bodyWrap {
 
 body.darkMode .fileTable th,
 body.darkMode .fileTable td {
-  border-bottom-color: #2a3a55;
+  border-bottom-color: var(--line);
   color: var(--text);
 }
 
@@ -686,7 +691,7 @@ body.darkMode .fileTable th {
 }
 
 body.darkMode .fileTable tr:hover td {
-  background: rgba(24, 36, 60, 0.72);
+  background: var(--hover);
 }
 
 .fileNameCell {
@@ -806,7 +811,7 @@ body.darkMode .fileTable tr:hover td {
 
 body.darkMode .skeletonTable th,
 body.darkMode .skeletonTable td {
-  border-bottom-color: #22324e;
+  border-bottom-color: var(--line);
 }
 
 .skeletonLine {
@@ -821,6 +826,17 @@ body.darkMode .skeletonTable td {
   );
   background-size: 220% 100%;
   animation: skeletonShimmer 1.15s linear infinite;
+}
+
+/* The light shimmer is a slate tint; on black it reads blue, so dark gets white alpha. */
+body.darkMode .skeletonLine {
+  background: linear-gradient(
+    90deg,
+    rgba(255, 255, 255, 0.05) 0%,
+    rgba(255, 255, 255, 0.13) 50%,
+    rgba(255, 255, 255, 0.05) 100%
+  );
+  background-size: 220% 100%;
 }
 
 .skeletonName {
@@ -879,7 +895,7 @@ body.darkMode .emptyStateImg {
 
 body.darkMode .fileContextMenu {
   background: var(--card);
-  border-color: rgba(120, 145, 188, 0.35);
+  border-color: var(--borderSoft);
 }
 
 .fileContextBtn {
@@ -911,7 +927,7 @@ body.darkMode .fileContextBtn {
 }
 
 body.darkMode .fileContextBtn:hover {
-  background: rgba(35, 50, 82, 0.8);
+  background: var(--hover);
 }
 
 .fileContextBtn:disabled {
@@ -956,7 +972,7 @@ body.darkMode .fileContextBtn:hover {
 }
 
 body.darkMode .ctxHint {
-  color: #cbd5e1;
+  color: var(--muted);
 }
 
 .ctxSeparator {
@@ -966,7 +982,7 @@ body.darkMode .ctxHint {
 }
 
 body.darkMode .ctxSeparator {
-  background: rgba(203, 213, 225, 0.3);
+  background: var(--line);
 }
 
 .fileContextBtn.delete {
@@ -1183,9 +1199,9 @@ body.darkMode .ctxSeparator {
 }
 
 body.darkMode .folderCreateCard {
-  border-color: #3a4c68;
-  background: #121a2b;
-  box-shadow: 0 18px 38px rgba(2, 8, 23, 0.55);
+  border-color: var(--border);
+  background: var(--card);
+  box-shadow: none;
 }
 
 .folderCreateHead {
@@ -1194,7 +1210,7 @@ body.darkMode .folderCreateCard {
 }
 
 body.darkMode .folderCreateHead {
-  border-bottom-color: #2d3f5f;
+  border-bottom-color: var(--line);
 }
 
 .folderCreateTitle {
@@ -1233,22 +1249,22 @@ body.darkMode .folderCreateHead {
 }
 
 body.darkMode .folderCreateInput {
-  border-color: #486594;
-  background: #0d172b;
-  color: #f1f5ff;
+  border-color: var(--borderSoft);
+  background: var(--field);
+  color: var(--text);
 }
 
 body.darkMode .folderCreateInput:focus {
-  border-color: #93a8cc;
+  border-color: var(--border);
 }
 
 body.darkMode .folderCreateInput::placeholder {
-  color: #93a8cc;
+  color: var(--muted);
   opacity: 1;
 }
 
 body.darkMode .folderCreateHint {
-  color: #9fb2d4;
+  color: var(--muted);
 }
 
 .folderCreateHint {
@@ -1281,9 +1297,9 @@ body.darkMode .folderCreateHint {
 }
 
 body.darkMode .folderCreateBtn {
-  border-color: rgba(203, 213, 225, 0.45);
-  background: rgba(16, 25, 43, 0.45);
-  color: #e5e7eb;
+  border-color: var(--borderSoft);
+  background: var(--field);
+  color: var(--text);
 }
 
 .folderCreateBtn.primary {
@@ -1293,6 +1309,34 @@ body.darkMode .folderCreateBtn {
 }
 
 body.darkMode .folderCreateBtn.primary {
+  border-color: #ffffff;
   background: #ffffff;
   color: #111111;
+}
+
+/* Light mode paints these with ink (rgba(17,17,17,...)), which vanishes on black.
+   Dark mode needs its own value, or the control loses its edge / its shadow shows. */
+body.darkMode .uploadStatusCard,
+body.darkMode .uploadCancelModalCard,
+body.darkMode .deleteConfirmCard {
+  box-shadow: none;
+}
+
+body.darkMode .uploadStatusClose {
+  border-color: var(--borderSoft);
+}
+
+body.darkMode .uploadStatusProgressWrap {
+  background: var(--field);
+}
+
+body.darkMode .bodyWrap.dragActive::before {
+  background: rgba(255, 255, 255, 0.04);
+}
+
+/* --border is pure white here, so the light mode ink fill hovers would be white on
+   white. Same fill, inverted text. */
+body.darkMode .themeSwitchBtn:hover,
+body.darkMode .browseSearchBtn:hover {
+  color: #000000;
 }

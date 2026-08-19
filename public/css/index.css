@@ -139,12 +139,26 @@ body {
   --font-display: "Sora", "Manrope", "Segoe UI", Roboto, Arial, sans-serif;
 }
 
+/* Vercel style dark: pure black page, near black surfaces, neutral grays, no blue tint.
+   Same layout, spacing and borders as light mode - only the palette changes. */
 body.darkMode {
-  --bg: #0a111f;
-  --card: #121a2b;
-  --text: #eef4ff;
-  --muted: #a8b5cc;
-  --border: #3a4c68;
+  --bg: #000000;
+  --card: #0a0a0a;
+  --text: #ededed;
+  --muted: #8f8f8f;
+  /* Light mode has three border tiers: full ink (#111) for structure, part ink
+     (rgba(17,17,17,0.2-0.45)) for controls and menus, and 8-12% ink for separators.
+     Dark mirrors them in white so cards get a real white edge without every hairline
+     in the app screaming. --border is pure white, so anything filling with it needs
+     black text (see the ink fill block further down). */
+  --border: #ffffff;
+  --borderSoft: rgba(255, 255, 255, 0.32);
+  --line: rgba(255, 255, 255, 0.14);
+  --field: #111111;
+  --hover: #1a1a1a;
+  --link: #3291ff;
+  --danger: #e5484d;
+  --dangerHover: #ff6166;
 }
 
 * {
@@ -239,20 +253,16 @@ body.darkMode {
   }
 }
 
+/* Dark theme: flat neutral surfaces on pure black, hairline borders, no glass, no shadows.
+   Every dark rule below reads a token from body.darkMode - keep it that way so the whole
+   palette stays changeable in one place instead of drifting into per rule hex codes. */
 body.darkMode .homeSearchInput,
 body.darkMode .searchClearBtn,
 body.darkMode .searchSuggest,
 body.darkMode .searchSuggestItem,
 body.darkMode .searchResults,
 body.darkMode .progressBar {
-  background: rgba(16, 24, 42, 0.46);
-}
-
-body.darkMode .homeSearchInput,
-body.darkMode .searchClearBtn,
-body.darkMode .homeSearchBtn {
-  backdrop-filter: blur(12px);
-  -webkit-backdrop-filter: blur(12px);
+  background: var(--field);
 }
 
 body.darkMode .homeSearchInput {
@@ -260,44 +270,44 @@ body.darkMode .homeSearchInput {
 }
 
 body.darkMode .homeSearchInput::placeholder {
-  color: #8fa1bf;
+  color: var(--muted);
 }
 
 body.darkMode .homeSearchLeadIcon {
-  color: #e2e8f0;
+  color: var(--text);
   opacity: 1;
 }
 
 body.darkMode .searchSuggestItem {
-  border-bottom-color: #1f2937;
+  border-bottom-color: var(--line);
 }
 
 body.darkMode .searchSuggestItem:hover {
-  background: #1a2540;
+  background: var(--hover);
 }
 
 body.darkMode .searchClearBtn {
-  border-color: #4e6287;
-  color: #9fb2d3;
+  border-color: var(--borderSoft);
+  color: var(--muted);
 }
 
 body.darkMode .searchTable th,
 body.darkMode .searchTable td {
-  border-bottom-color: #2a3a55;
+  border-bottom-color: var(--line);
   color: var(--text);
 }
 
 body.darkMode .searchTable tr:hover td {
-  background: rgba(24, 36, 60, 0.72);
+  background: var(--hover);
 }
 
 body.darkMode .searchLink {
-  color: #8cbcff;
+  color: var(--link);
 }
 
 body.darkMode .modal {
   background: var(--card);
-  border-color: #4a5f84;
+  border-color: var(--border);
 }
 
 body.darkMode .modalHead,
@@ -306,49 +316,48 @@ body.darkMode .modalBody {
 }
 
 body.darkMode .modalClose {
-  border-color: rgba(203, 213, 225, 0.35);
-  background: rgba(16, 25, 43, 0.72);
+  border-color: var(--borderSoft);
+  background: var(--field);
   color: var(--text);
 }
 
 body.darkMode #logoutConfirmModal {
-  background: rgba(2, 6, 23, 0.62);
+  background: rgba(0, 0, 0, 0.72);
 }
 
 body.darkMode .logoutConfirmCard {
-  background: rgba(16, 24, 42, 0.72);
-  border-color: rgba(120, 145, 188, 0.45);
+  background: var(--card);
+  border-color: var(--border);
 }
 
 body.darkMode .logoutConfirmEmail {
-  color: #e6edf9;
+  color: var(--text);
 }
 
 body.darkMode .logoutConfirmProvider,
 body.darkMode .logoutConfirmWarn {
-  color: #b8c8e3;
+  color: var(--muted);
 }
 
 body.darkMode .logoutConfirmCancel {
-  border-color: rgba(184, 200, 227, 0.6);
-  color: #dbe7fb;
+  border-color: var(--borderSoft);
+  color: var(--text);
   background: transparent;
 }
 
 body.darkMode .logoutConfirmCancel:hover {
-  background: rgba(35, 50, 82, 0.45);
+  background: var(--hover);
 }
 
 body.darkMode .logoutConfirmSubmit {
-  border-color: #ef4444;
-  background: #dc2626;
+  border-color: var(--danger);
+  background: var(--danger);
   color: #fff;
 }
 
 body.darkMode .logoutConfirmSubmit:hover {
-  border-color: #b91c1c;
-  background: #b91c1c;
-  box-shadow: inset 0 1px 4px rgba(0, 0, 0, 0.25);
+  border-color: var(--dangerHover);
+  background: var(--dangerHover);
 }
 
 body.darkMode .sidebar,
@@ -358,17 +367,17 @@ body.darkMode .card {
 }
 
 body.darkMode .searchState {
-  border-color: #4a5f84;
+  border-color: var(--border);
 }
 
 body.darkMode .totalStorageCard {
-  border-color: #4a5f84;
-  background: rgba(16, 24, 42, 0.5);
+  border-color: var(--border);
+  background: var(--card);
 }
 
 body.darkMode .totalStorageBar {
-  border-color: #4a5f84;
-  background: rgba(16, 24, 42, 0.6);
+  border-color: var(--border);
+  background: var(--field);
 }
 
 body.darkMode .uploadOption,
@@ -377,48 +386,49 @@ body.darkMode .uploadChoiceBtn,
 body.darkMode .megaLoginInput,
 body.darkMode .megaLoginBtn,
 body.darkMode .providerOptionBtn {
-  background: #10182a;
-  border-color: #4a5f84;
+  background: var(--field);
+  border-color: var(--borderSoft);
   color: var(--text);
 }
 
 body.darkMode .uploadChoiceBtn:hover,
 body.darkMode .megaLoginBtn:hover,
 body.darkMode .providerOptionBtn:hover {
-  background: #243452;
+  background: var(--hover);
 }
 
 body.darkMode .fileTable th {
-  background: rgba(16, 24, 43, 0.86);
+  background: var(--field);
   color: var(--text);
-  border-bottom-color: #2d3f5f;
+  border-bottom-color: var(--line);
 }
 
 body.darkMode .fileTable td {
-  border-bottom-color: #2a3a55;
+  border-bottom-color: var(--line);
 }
 
 body.darkMode .fileTable tr:hover td {
-  background: rgba(24, 36, 60, 0.72);
+  background: var(--hover);
 }
 
 body.darkMode .browseNav {
-  border-bottom-color: #2d3f5f;
-  background: rgba(13, 20, 35, 0.66);
+  border-bottom-color: var(--line);
+  background: var(--card);
 }
 
 body.darkMode .browseNavBtn {
-  border-color: #4a5f84;
-  background: rgba(16, 25, 43, 0.74);
+  border-color: var(--borderSoft);
+  background: var(--field);
   color: var(--text);
 }
 
 body.darkMode .browseNavBtn:hover {
-  background: rgba(25, 37, 62, 0.92);
+  background: var(--hover);
 }
 
 body.darkMode .browseNavBtn.active {
-  background: rgba(79, 102, 145, 0.32);
+  background: var(--hover);
+  border-color: var(--border);
 }
 
 body.darkMode .fileMime,
@@ -435,7 +445,7 @@ body.darkMode .megaLoginStatus {
 
 body.darkMode .fileContextMenu {
   background: var(--card);
-  border-color: rgba(120, 145, 188, 0.35);
+  border-color: var(--borderSoft);
 }
 
 body.darkMode .fileContextBtn {
@@ -443,15 +453,66 @@ body.darkMode .fileContextBtn {
 }
 
 body.darkMode .fileContextBtn:hover {
-  background: rgba(35, 50, 82, 0.8);
+  background: var(--hover);
 }
 
 body.darkMode .ctxHint {
-  color: #b8c8e3;
+  color: var(--muted);
 }
 
 body.darkMode .ctxSeparator {
-  background: rgba(120, 145, 188, 0.32);
+  background: var(--line);
+}
+
+/* --border is pure white in dark mode, so light mode's "fill with ink, white text"
+   hover would be white on white. Same fill, inverted text. The three hovers at the
+   uploadChoiceBtn rule above are excluded on purpose - they repaint to var(--hover),
+   so their text has to stay light. */
+body.darkMode .themeSwitchBtn:hover,
+body.darkMode .addBtn:hover,
+body.darkMode .demoVideoBtn:hover,
+body.darkMode .githubBtn:hover,
+body.darkMode .homeSearchBtn:hover,
+body.darkMode .avatar,
+body.darkMode .browseBtn:hover,
+body.darkMode .providerOptionSettingsBtn:hover,
+body.darkMode .googleOauthBtn:hover,
+body.darkMode .googleOauthGuideBtn:hover,
+body.darkMode .namePromptBtn:hover {
+  color: #000000;
+}
+
+/* These share their light mode rule, which paints with rgba(17,17,17,...) - ink on paper.
+   Ink on black is invisible, so dark mode needs its own value. */
+body.darkMode .uploadStatusCard {
+  box-shadow: none;
+}
+
+body.darkMode .uploadStatusBar {
+  background: var(--field);
+}
+
+body.darkMode .providerOptionSettingsItem:hover {
+  background: var(--hover);
+}
+
+body.darkMode .skeletonWave,
+body.darkMode .totalStorageCard.loading .totalStorageMeta::after,
+body.darkMode .totalStorageCard.loading .totalStorageText::after,
+body.darkMode .totalStorageCard.loading .totalStorageFill {
+  background: linear-gradient(
+    90deg,
+    rgba(255, 255, 255, 0.05) 0%,
+    rgba(255, 255, 255, 0.13) 50%,
+    rgba(255, 255, 255, 0.05) 100%
+  );
+}
+
+body.darkMode .searchSkeletonTable th,
+body.darkMode .searchSkeletonTable td,
+body.darkMode .browseSkeletonTable th,
+body.darkMode .browseSkeletonTable td {
+  border-bottom-color: var(--line);
 }
 
 .layout {
@@ -576,6 +637,41 @@ body.darkMode .accountSectionIcon img {
   gap: 12px;
 }
 
+.greetingActions {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+}
+
+/* Circle sibling of the demo button: same 2px border language, flat, no shadow.
+   The icon is fill: currentColor, so it follows the hover and dark mode text colour. */
+.githubBtn {
+  width: 38px;
+  height: 38px;
+  flex: 0 0 38px;
+  border: 2px solid var(--border);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  cursor: pointer;
+}
+
+.githubBtn svg {
+  width: 30px;
+  height: 30px;
+  display: block;
+  fill: currentColor;
+}
+
+.githubBtn:hover {
+  background: var(--border);
+  color: #fff;
+}
+
 .demoVideoBtn {
   border: 2px dashed var(--border);
   border-radius: 999px;
@@ -639,7 +735,7 @@ body.darkMode .accountSectionIcon img {
   transform: translateY(-50%);
   width: 20px;
   height: 20px;
-  color: #64748b;
+  color: var(--muted);
   pointer-events: none;
   z-index: 2;
   opacity: 1;
@@ -877,17 +973,17 @@ body.darkMode .emptyStateImg {
 }
 
 body.darkMode .searchSuggest {
-  background: rgba(16, 24, 42, 0.58);
-  border-color: #4a5f84;
+  background: var(--card);
+  border-color: var(--border);
   box-shadow: none;
 }
 
 body.darkMode .searchSuggestItem {
-  border-bottom-color: #2a3a55;
+  border-bottom-color: var(--line);
 }
 
 body.darkMode .searchSuggestItem:hover {
-  background: rgba(56, 78, 118, 0.32);
+  background: var(--hover);
 }
 
 .searchState {
@@ -1102,7 +1198,7 @@ body.darkMode .searchSuggestItem:hover {
   font-style: normal;
   font-size: 18px;
   line-height: 1;
-  color: #64748b;
+  color: var(--muted);
   flex: 0 0 auto;
 }
 
@@ -1216,17 +1312,17 @@ body.darkMode .searchSuggestItem:hover {
 }
 
 body.darkMode .searchActionBtn:hover {
-  background: rgba(147, 163, 191, 0.16);
+  background: var(--hover);
 }
 
 body.darkMode .searchActionMenu {
-  background: #10182a;
-  border-color: rgba(120, 145, 188, 0.35);
-  box-shadow: 0 10px 30px rgba(2, 6, 23, 0.5);
+  background: var(--card);
+  border-color: var(--borderSoft);
+  box-shadow: none;
 }
 
 body.darkMode .searchActionMenuBtn:hover {
-  background: rgba(35, 50, 82, 0.8);
+  background: var(--hover);
 }
 
 .grid {
@@ -1915,7 +2011,7 @@ body.darkMode .searchActionMenuBtn:hover {
 
 body.darkMode .searchSkeletonTable th,
 body.darkMode .searchSkeletonTable td {
-  border-bottom-color: #2a3a55;
+  border-bottom-color: var(--line);
 }
 
 .searchSkeletonCell {
@@ -1935,7 +2031,7 @@ body.darkMode .searchSkeletonTable td {
 
 body.darkMode .browseSkeletonTable th,
 body.darkMode .browseSkeletonTable td {
-  border-bottom-color: #22324e;
+  border-bottom-color: var(--line);
 }
 
 .emptyStateImg {
@@ -2266,7 +2362,7 @@ body.darkMode .browseSkeletonTable td {
 }
 
 body.darkMode .providerOptionSettingsMenu {
-  box-shadow: 0 14px 26px rgba(2, 8, 23, 0.45);
+  box-shadow: none;
 }
 
 .providerOptionBtn:hover {

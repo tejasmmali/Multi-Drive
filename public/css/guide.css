@@ -6,12 +6,32 @@
         --border: #111111;
         --font-ui: "Manrope", "Segoe UI", Roboto, Arial, sans-serif;
       }
+      /* Same Vercel dark tokens as index.css and browse.css - guide.css loads last, so
+         this block is the one that wins on the guide page. Keep all three identical. */
       body.darkMode {
-        --bg: #0a111f;
-        --card: #121a2b;
-        --text: #eef4ff;
-        --muted: #a8b5cc;
-        --border: #3a4c68;
+        --bg: #000000;
+        --card: #0a0a0a;
+        --text: #ededed;
+        --muted: #8f8f8f;
+        /* White structure, 32% white for controls, 14% white for hairlines. */
+        --border: #ffffff;
+        --borderSoft: rgba(255, 255, 255, 0.32);
+        --line: rgba(255, 255, 255, 0.14);
+        --field: #111111;
+        --hover: #1a1a1a;
+        --link: #3291ff;
+        --danger: #e5484d;
+        --dangerHover: #ff6166;
+      }
+      /* The blue tints below are light mode paint; on black they read as a blue cast. */
+      body.darkMode .guideCard code {
+        background: var(--field);
+      }
+      body.darkMode .imgPlaceholder {
+        background: rgba(255, 255, 255, 0.03);
+      }
+      body.darkMode .imgPlaceholder img {
+        border-color: var(--line);
       }
       * {
         box-sizing: border-box;
